@@ -1,0 +1,9 @@
+ship_name,date,arrival_time,departure_time,port,size,good_ship
+Costa Diadema,2026-08-04,11:30,19:30,geiranger_4B_SW,big,false
+MSC Euribia,2026-08-12,12:00,21:00,geiranger_3S,big,true
+AIDA Nova,2026-08-12,09:00,17:00,hellesylt,big,false
+Viking Sky,2026-08-20,10:00,18:00,geiranger_4B_SW,small,true
+Mein Schiff 1,2026-07-15,11:00,20:00,geiranger_3S,big,false
+Carnival Panorama,2026-07-22,09:30,17:30,geiranger_2,big,true
+Queen Mary 2,2026-09-05,10:00,19:00,geiranger_4B_SW,big,true
+Norwegian Bliss,2026-06-10,12:00,20:00,geiranger_3S,big,false

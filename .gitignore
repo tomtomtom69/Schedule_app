@@ -1,0 +1,20 @@
+# environment variables
+.env
+
+# docker volumes
+volumes/
+db_data/
+data/
+
+# python
+__pycache__/
+*.pyc
+
+# node
+node_modules/
+
+# logs
+*.log
+
+# vscode settings
+.vscode/
