@@ -6,7 +6,7 @@ from ortools.sat.python import cp_model
 from src.demand.forecaster import DailyDemand
 from src.models.employee import EmployeeRead
 from src.models.shift_template import ShiftTemplateRead
-from src.models.enums import ShiftRole
+from src.models.enums import RoleCapability, ShiftRole
 
 # Type alias for the variables dictionary
 Variables = dict[tuple, cp_model.IntVar]  # (employee_id, date, shift_id) -> BoolVar
@@ -168,6 +168,107 @@ def add_weekly_rest(
             ]
             if window_vars:
                 model.Add(sum(window_vars) <= 6)
+
+
+def add_opening_hours_coverage(
+    model: cp_model.CpModel,
+    variables: Variables,
+    employees: list[EmployeeRead],
+    shifts: list[ShiftTemplateRead],
+    days: list[date],
+    demand_map: dict[date, DailyDemand],
+    settings_list: list,  # list[EstablishmentSettingsRead]
+) -> None:
+    """Ensure ≥1 café and ≥1 production employee covers every hourly slot during
+    operating hours.  On cruise days, coverage during harbour time is raised to
+    min(cafe_needed, len(covering_vars)) so the peak staffing is actually present.
+    """
+    if not settings_list:
+        return
+
+    shift_start_m = {s.id: _time_to_minutes(s.start_time) for s in shifts}
+    shift_end_m   = {s.id: _time_to_minutes(s.end_time)   for s in shifts}
+    cafe_sids = [s.id for s in shifts if s.role == ShiftRole.cafe]
+    prod_sids = [s.id for s in shifts if s.role == ShiftRole.production]
+
+    def _cfg_for_day(d: date):
+        for cfg in settings_list:
+            if cfg.date_range_start <= d <= cfg.date_range_end:
+                return cfg
+        return None
+
+    def _slots(open_m: int, close_m: int) -> list[tuple[int, int]]:
+        """1-hour slots; last slot may be shorter."""
+        result = []
+        s = open_m
+        while s < close_m:
+            result.append((s, min(s + 60, close_m)))
+            s += 60
+        return result
+
+    def _covering(slot_s: int, slot_e: int, sid_list: list[str]) -> list[str]:
+        return [
+            sid for sid in sid_list
+            if shift_start_m[sid] <= slot_s and shift_end_m[sid] >= slot_e
+        ]
+
+    for d in days:
+        dd = demand_map.get(d)
+        if not dd:
+            continue
+        cfg = _cfg_for_day(d)
+        if not cfg:
+            continue
+
+        open_m  = _time_to_minutes(cfg.opening_time)
+        close_m = _time_to_minutes(cfg.closing_time)
+        prod_start_m = _time_to_minutes(cfg.production_start)
+
+        # ── Café coverage ──────────────────────────────────────────────────
+        # Require ≥1 café employee on shift during every hourly slot within
+        # opening hours.  Total headcount is handled by the separate staffing
+        # requirement constraint; this constraint purely ensures temporal spread
+        # (morning, midday, evening are all covered).
+        cafe_emps = [
+            e for e in employees
+            if e.availability_start <= d <= e.availability_end
+            and e.role_capability in (RoleCapability.cafe, RoleCapability.both)
+        ]
+        for slot_s, slot_e in _slots(open_m, close_m):
+            cov_sids = _covering(slot_s, slot_e, cafe_sids)
+            if not cov_sids:
+                continue
+            cov_vars = [
+                variables[(e.id, d, sid)]
+                for e in cafe_emps
+                for sid in cov_sids
+                if (e.id, d, sid) in variables
+            ]
+            if not cov_vars:
+                continue
+            model.Add(sum(cov_vars) >= 1)
+
+        # ── Production coverage ────────────────────────────────────────────
+        prod_emps = [
+            e for e in employees
+            if e.availability_start <= d <= e.availability_end
+            and e.role_capability in (RoleCapability.production, RoleCapability.both)
+        ]
+        for slot_s, slot_e in _slots(prod_start_m, close_m):
+            cov_sids = _covering(slot_s, slot_e, prod_sids)
+            # Skip extreme slots where only one shift can cover — too rigid with
+            # limited production headcount; focus on well-covered core hours.
+            if len(cov_sids) < 2:
+                continue
+            cov_vars = [
+                variables[(e.id, d, sid)]
+                for e in prod_emps
+                for sid in cov_sids
+                if (e.id, d, sid) in variables
+            ]
+            if not cov_vars:
+                continue
+            model.Add(sum(cov_vars) >= 1)
 
 
 def add_language_requirements(

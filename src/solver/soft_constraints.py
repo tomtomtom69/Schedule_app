@@ -17,6 +17,7 @@ WEIGHTS = {
     "employee_preferences": 5,
     "fair_distribution": 5,
     "minimize_overtime": 3,
+    "shift_variety": 2,         # small penalty for same shift on consecutive days
 }
 
 _MAX_WEEKLY_MINUTES = 48 * 60
@@ -61,6 +62,7 @@ def add_soft_constraints(
     respect_preferences(model, variables, employees, shifts, days, obj_vars, obj_coeffs)
     minimize_overtime(model, variables, employees, shifts, days, obj_vars, obj_coeffs)
     distribute_hours_fairly(model, variables, employees, shifts, days, obj_vars, obj_coeffs)
+    penalize_same_shift_consecutive(model, variables, employees, shifts, days, obj_vars, obj_coeffs)
 
     if obj_vars:
         model.Maximize(cp_model.LinearExpr.WeightedSum(obj_vars, obj_coeffs))
@@ -306,3 +308,38 @@ def distribute_hours_fairly(
 
     obj_vars.append(spread)
     obj_coeffs.append(-w)
+
+
+def penalize_same_shift_consecutive(
+    model: cp_model.CpModel,
+    variables: Variables,
+    employees: list[EmployeeRead],
+    shifts: list[ShiftTemplateRead],
+    days: list[date],
+    obj_vars: list,
+    obj_coeffs: list,
+) -> None:
+    """Penalise an employee being on the exact same shift on two consecutive days.
+
+    This discourages the solver from taking the lazy path of assigning everyone
+    to the same shift (e.g. shift 5) every day.
+    """
+    w = WEIGHTS["shift_variety"]
+    sorted_days = sorted(days)
+
+    for emp in employees:
+        for i in range(len(sorted_days) - 1):
+            d1, d2 = sorted_days[i], sorted_days[i + 1]
+            if (d2 - d1).days != 1:
+                continue  # Not consecutive calendar days — skip
+            for s in shifts:
+                v1 = variables.get((emp.id, d1, s.id))
+                v2 = variables.get((emp.id, d2, s.id))
+                if v1 is None or v2 is None:
+                    continue
+                # both_same = 1 iff employee works the identical shift on both days
+                both_same = model.NewBoolVar(f"sameshift_{emp.id}_{d1}_{s.id}")
+                model.AddBoolAnd([v1, v2]).OnlyEnforceIf(both_same)
+                model.AddBoolOr([v1.Not(), v2.Not()]).OnlyEnforceIf(both_same.Not())
+                obj_vars.append(both_same)
+                obj_coeffs.append(-w)

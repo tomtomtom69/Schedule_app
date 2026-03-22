@@ -132,9 +132,32 @@ def _save_schedule(schedule: ScheduleRead) -> bool:
         return False
 
 
-# ── Layout ────────────────────────────────────────────────────────────────────
+# ── Session state initialisation (must happen before any widget) ──────────────
 
-main_col, chat_col = st.columns([3, 1])
+if "editor_year" not in st.session_state:
+    st.session_state["editor_year"] = 2026
+if "editor_month" not in st.session_state:
+    st.session_state["editor_month"] = 8
+
+# Handle pending navigation from "Use current session schedule" button
+if "_pending_editor_year" in st.session_state:
+    st.session_state["editor_year"] = st.session_state.pop("_pending_editor_year")
+    st.session_state["editor_month"] = st.session_state.pop("_pending_editor_month")
+
+# ── Layout ────────────────────────────────────────────────────────────────────
+_chat_expanded = st.session_state.get("chat_expanded", False)
+
+if _chat_expanded:
+    if st.button(
+        "📅  Return to Schedule View  —  click here to go back to the full schedule grid",
+        type="primary",
+        use_container_width=True,
+        key="return_schedule_banner",
+    ):
+        st.session_state["chat_expanded"] = False
+        st.rerun()
+
+main_col, chat_col = st.columns([2, 3] if _chat_expanded else [3, 1])
 
 with main_col:
 
@@ -169,8 +192,6 @@ with main_col:
         sched = _load_saved_schedule(sel_year, sel_month)
         if sched:
             st.session_state["editor_schedule"] = sched
-            st.session_state["editor_year"] = sel_year
-            st.session_state["editor_month"] = sel_month
             st.success(f"Loaded {SEASON_MONTHS[sel_month]} {sel_year} (status: {sched.status.value})")
         else:
             st.warning(f"No saved schedule for {SEASON_MONTHS[sel_month]} {sel_year}.")
@@ -179,9 +200,10 @@ with main_col:
         sched = st.session_state.get("current_schedule")
         if sched:
             st.session_state["editor_schedule"] = sched
-            st.session_state["editor_year"] = sched.year
-            st.session_state["editor_month"] = sched.month
-            st.success("Loaded schedule from Schedule Generator page.")
+            # Use pending keys + rerun so we don't assign to widget keys after they've rendered
+            st.session_state["_pending_editor_year"] = sched.year
+            st.session_state["_pending_editor_month"] = sched.month
+            st.rerun()
         else:
             st.warning("No schedule in session. Generate one on the Schedule page first.")
 
@@ -199,6 +221,11 @@ with main_col:
         st.stop()
 
     st.divider()
+
+    # Flash banner when LLM Apply updates the grid
+    if "_apply_flash" in st.session_state:
+        st.success(f"✅ {st.session_state.pop('_apply_flash')} — schedule grid updated below")
+
     st.subheader(f"Editing: {SEASON_MONTHS[schedule.month]} {schedule.year}  — Status: {schedule.status.value.upper()}")
 
     # ── Build pivot DataFrame ─────────────────────────────────────────────────

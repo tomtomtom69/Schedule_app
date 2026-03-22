@@ -8,6 +8,7 @@ import streamlit as st
 from src.db.database import db_session
 from src.ingestion.csv_parser import parse_employees_csv
 from src.ingestion.validators import validate_employee_list
+from src.models.cruise_ship import CruiseShipORM
 from src.models.employee import EmployeeORM, EmployeeRead
 
 st.set_page_config(page_title="Employees", page_icon="👥", layout="wide")
@@ -247,79 +248,106 @@ with tab_upload:
     uploaded = st.file_uploader("Choose file", type=["csv", "xlsx"])
 
     if uploaded:
-        records, errors = parse_employees_csv(uploaded)
-
-        if errors:
-            st.error(f"{len(errors)} row(s) failed validation:")
-            for err in errors:
-                st.write(f"- Row {err['row']}: {err['error']}")
-
-        if records:
-            st.session_state["employees_unsaved"] = len(records)
-            st.success(f"{len(records)} employee(s) parsed successfully.")
-
-            warnings = validate_employee_list(records)
-            for w in warnings:
-                st.warning(w)
-
-            import pandas as pd
-            preview_data = [
-                {
-                    "Name": r.name,
-                    "Role": r.role_capability.value if hasattr(r.role_capability, 'value') else r.role_capability,
-                    "Type": r.employment_type.value if hasattr(r.employment_type, 'value') else r.employment_type,
-                    "Hours": r.contracted_hours,
-                    "Housing": r.housing,
-                    "Driver": r.driving_licence,
-                    "Languages": ", ".join(r.languages),
-                }
-                for r in records
-            ]
-            st.dataframe(preview_data, use_container_width=True, hide_index=True)
-
-            import_mode = st.radio(
-                "Import mode",
-                ["Append (add new, update existing by name)", "Replace all (delete existing first)"],
-                horizontal=True,
+        # If this exact file was already saved this session, don't re-parse / re-warn
+        if st.session_state.get("_employees_saved_file") == uploaded.name:
+            _saved_count = st.session_state.get("_employees_save_count", 0)
+            st.success(
+                f"✅ **{_saved_count} employee(s)** from this file are already saved to the database.  \n"
+                "Remove the file above and upload a different one to add more employees."
             )
+        else:
+            # New file — clear any stale saved marker
+            st.session_state.pop("_employees_saved_file", None)
+            records, errors = parse_employees_csv(uploaded)
 
-            st.divider()
-            with st.container(border=True):
-                st.markdown(
-                    f"### 💾 Save {len(records)} Employee(s) to Database",
-                    help="This will write the previewed employees to the database.",
+            if errors:
+                st.error(f"{len(errors)} row(s) failed validation:")
+                for err in errors:
+                    st.write(f"- Row {err['row']}: {err['error']}")
+
+            if records:
+                st.session_state["employees_unsaved"] = len(records)
+                st.success(f"{len(records)} employee(s) parsed successfully.")
+
+                # Year mismatch check against existing ship data
+                try:
+                    with db_session() as db:
+                        ship_years = {r.date.year for r in db.query(CruiseShipORM).all()}
+                    if ship_years:
+                        emp_years = {r.availability_start.year for r in records} | {r.availability_end.year for r in records}
+                        if not emp_years & ship_years:
+                            st.warning(
+                                f"⚠️ **Year mismatch:** Employee availability covers {sorted(emp_years)} "
+                                f"but cruise ship data is for {sorted(ship_years)}. "
+                                "The solver will have zero available employees — update availability dates or re-upload ships."
+                            )
+                except Exception:
+                    pass
+
+                warnings = validate_employee_list(records)
+                for w in warnings:
+                    st.warning(w)
+
+                import pandas as pd
+                preview_data = [
+                    {
+                        "Name": r.name,
+                        "Role": r.role_capability.value if hasattr(r.role_capability, 'value') else r.role_capability,
+                        "Type": r.employment_type.value if hasattr(r.employment_type, 'value') else r.employment_type,
+                        "Hours": r.contracted_hours,
+                        "Housing": r.housing,
+                        "Driver": r.driving_licence,
+                        "Languages": ", ".join(r.languages),
+                    }
+                    for r in records
+                ]
+                st.dataframe(preview_data, use_container_width=True, hide_index=True)
+
+                import_mode = st.radio(
+                    "Import mode",
+                    ["Append (add new, update existing by name)", "Replace all (delete existing first)"],
+                    horizontal=True,
                 )
-                st.caption(
-                    "Mode: **Replace all**" if "Replace" in import_mode
-                    else "Mode: **Append / update by name**"
-                )
-                if st.button(
-                    f"✅ Save {len(records)} Employee(s) to Database",
-                    type="primary",
-                    use_container_width=True,
-                    key="save_employees_btn",
-                ):
-                    try:
-                        with db_session() as db:
-                            if "Replace" in import_mode:
-                                db.query(EmployeeORM).delete()
-                            for record in records:
-                                existing = db.query(EmployeeORM).filter_by(name=record.name).first()
-                                if existing:
-                                    for field, value in record.model_dump().items():
-                                        setattr(existing, field, value)
-                                else:
-                                    db.add(EmployeeORM(**record.model_dump()))
-                        st.session_state.pop("employees_unsaved", None)
-                        st.components.v1.html(
-                            "<script>window.parent.onbeforeunload = null;</script>",
-                            height=0,
-                        )
-                        st.success(
-                            f"✅ **{len(records)} employee(s) saved successfully!**  \n"
-                            "The Employee List tab now shows the updated data."
-                        )
-                        st.balloons()
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Save failed: {e}")
+
+                st.divider()
+                with st.container(border=True):
+                    st.markdown(
+                        f"### 💾 Save {len(records)} Employee(s) to Database",
+                        help="This will write the previewed employees to the database.",
+                    )
+                    st.caption(
+                        "Mode: **Replace all**" if "Replace" in import_mode
+                        else "Mode: **Append / update by name**"
+                    )
+                    if st.button(
+                        f"✅ Save {len(records)} Employee(s) to Database",
+                        type="primary",
+                        use_container_width=True,
+                        key="save_employees_btn",
+                    ):
+                        try:
+                            with db_session() as db:
+                                if "Replace" in import_mode:
+                                    db.query(EmployeeORM).delete()
+                                for record in records:
+                                    existing = db.query(EmployeeORM).filter_by(name=record.name).first()
+                                    if existing:
+                                        for field, value in record.model_dump().items():
+                                            setattr(existing, field, value)
+                                    else:
+                                        db.add(EmployeeORM(**record.model_dump()))
+                            st.session_state["_employees_saved_file"] = uploaded.name
+                            st.session_state["_employees_save_count"] = len(records)
+                            st.session_state.pop("employees_unsaved", None)
+                            st.components.v1.html(
+                                "<script>window.parent.onbeforeunload = null;</script>",
+                                height=0,
+                            )
+                            st.success(
+                                f"✅ **{len(records)} employee(s) saved successfully!**  \n"
+                                "The Employee List tab now shows the updated data."
+                            )
+                            st.balloons()
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Save failed: {e}")

@@ -153,73 +153,100 @@ with tab_ships:
     uploaded_ships = st.file_uploader("Choose file", type=["csv", "xlsx"], key="ships_upload")
 
     if uploaded_ships:
-        records, errors = parse_cruise_ships_csv(uploaded_ships)
+        # If this exact file was already saved this session, don't re-parse / re-warn
+        if st.session_state.get("_ships_saved_file") == uploaded_ships.name:
+            _saved_count = st.session_state.get("_ships_save_count", 0)
+            st.success(
+                f"✅ **{_saved_count} ship arrival(s)** from this file are already saved to the database.  \n"
+                "Remove the file above and upload a different one to add more arrivals."
+            )
+        else:
+            st.session_state.pop("_ships_saved_file", None)
+            records, errors = parse_cruise_ships_csv(uploaded_ships)
 
-        if errors:
-            st.error(f"{len(errors)} row(s) failed validation:")
-            for err in errors:
-                st.write(f"- Row {err['row']}: {err['error']}")
+            if errors:
+                st.error(f"{len(errors)} row(s) failed validation:")
+                for err in errors:
+                    st.write(f"- Row {err['row']}: {err['error']}")
 
-        if records:
-            st.session_state["ships_unsaved"] = len(records)
-            st.success(f"{len(records)} ship arrival(s) parsed.")
+            if records:
+                st.session_state["ships_unsaved"] = len(records)
+                st.success(f"{len(records)} ship arrival(s) parsed.")
 
-            warnings = validate_cruise_schedule(records)
-            for w in warnings:
-                st.warning(w)
+                # Year mismatch check against existing employee data
+                try:
+                    with db_session() as db:
+                        emp_rows = db.query(EmployeeORM).all()
+                    if emp_rows:
+                        emp_years = {e.availability_start.year for e in emp_rows} | {e.availability_end.year for e in emp_rows}
+                        ship_years = {r.date.year for r in records}
+                        if not ship_years & emp_years:
+                            st.warning(
+                                f"⚠️ **Year mismatch:** Ship arrivals are in {sorted(ship_years)} "
+                                f"but employees are available in {sorted(emp_years)}. "
+                                "The solver will produce empty schedules — check availability dates."
+                            )
+                except Exception:
+                    pass
 
-            import pandas as pd
-            preview = [
-                {
-                    "Date": str(r.date),
-                    "Ship": r.ship_name,
-                    "Port": str(r.port),
-                    "Arrival": str(r.arrival_time)[:5],
-                    "Departure": str(r.departure_time)[:5],
-                    "Size": str(r.size),
-                    "Good Ship": r.good_ship,
-                }
-                for r in records
-            ]
-            st.dataframe(preview, use_container_width=True, hide_index=True)
+                warnings = validate_cruise_schedule(records)
+                for w in warnings:
+                    st.warning(w)
 
-            st.divider()
-            with st.container(border=True):
-                st.markdown(
-                    f"### 🚢 Save {len(records)} Ship Arrival(s) to Database",
-                    help="Upserts by (ship_name, date) — existing records will be updated.",
-                )
-                if st.button(
-                    f"✅ Save {len(records)} Ship Arrival(s) to Database",
-                    type="primary",
-                    use_container_width=True,
-                    key="save_ships_btn",
-                ):
-                    try:
-                        with db_session() as db:
-                            for record in records:
-                                data = record.model_dump()
-                                existing = (
-                                    db.query(CruiseShipORM)
-                                    .filter_by(ship_name=record.ship_name, date=record.date)
-                                    .first()
-                                )
-                                if existing:
-                                    for k, v in data.items():
-                                        setattr(existing, k, v)
-                                else:
-                                    db.add(CruiseShipORM(**data))
-                        st.session_state.pop("ships_unsaved", None)
-                        st.components.v1.html(
-                            "<script>window.parent.onbeforeunload = null;</script>",
-                            height=0,
-                        )
-                        st.success(
-                            f"✅ **{len(records)} ship arrival(s) saved successfully!**  \n"
-                            "The Ship List tab now shows the updated schedule."
-                        )
-                        st.balloons()
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Save failed: {e}")
+                import pandas as pd
+                preview = [
+                    {
+                        "Date": str(r.date),
+                        "Ship": r.ship_name,
+                        "Port": str(r.port),
+                        "Arrival": str(r.arrival_time)[:5],
+                        "Departure": str(r.departure_time)[:5],
+                        "Size": str(r.size),
+                        "Good Ship": r.good_ship,
+                    }
+                    for r in records
+                ]
+                st.dataframe(preview, use_container_width=True, hide_index=True)
+
+                st.divider()
+                with st.container(border=True):
+                    st.markdown(
+                        f"### 🚢 Save {len(records)} Ship Arrival(s) to Database",
+                        help="Upserts by (ship_name, date) — existing records will be updated.",
+                    )
+                    if st.button(
+                        f"✅ Save {len(records)} Ship Arrival(s) to Database",
+                        type="primary",
+                        use_container_width=True,
+                        key="save_ships_btn",
+                    ):
+                        try:
+                            with db_session() as db:
+                                for record in records:
+                                    data = record.model_dump()
+                                    existing = (
+                                        db.query(CruiseShipORM)
+                                        .filter_by(ship_name=record.ship_name, date=record.date)
+                                        .first()
+                                    )
+                                    if existing:
+                                        for k, v in data.items():
+                                            setattr(existing, k, v)
+                                    else:
+                                        db.add(CruiseShipORM(**data))
+                            st.session_state["_ships_saved_file"] = uploaded_ships.name
+                            st.session_state["_ships_save_count"] = len(records)
+                            st.session_state.pop("ships_unsaved", None)
+                            st.components.v1.html(
+                                "<script>window.parent.onbeforeunload = null;</script>",
+                                height=0,
+                            )
+                            st.success(
+                                f"✅ **{len(records)} ship arrival(s) saved successfully!**  \n"
+                                "The Ship List tab now shows the updated schedule."
+                            )
+                            st.balloons()
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Save failed: {e}")
 

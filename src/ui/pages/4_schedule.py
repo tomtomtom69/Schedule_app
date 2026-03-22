@@ -186,8 +186,21 @@ def compute_weekly_hours(
 
 
 # ── Layout: two columns (main + chat) ────────────────────────────────────────
+# Column ratio widens the chat panel when the user has toggled expanded mode
+_chat_expanded = st.session_state.get("chat_expanded", False)
 
-main_col, chat_col = st.columns([3, 1])
+# Full-width return banner shown above everything when in expanded chat mode
+if _chat_expanded:
+    if st.button(
+        "📅  Return to Schedule View  —  click here to go back to the full schedule grid",
+        type="primary",
+        use_container_width=True,
+        key="return_schedule_banner",
+    ):
+        st.session_state["chat_expanded"] = False
+        st.rerun()
+
+main_col, chat_col = st.columns([2, 3] if _chat_expanded else [3, 1])
 
 with main_col:
 
@@ -222,6 +235,27 @@ with main_col:
         st.warning("No shift templates found. Go to Settings to configure shifts.")
         st.stop()
 
+    # ── Pre-generate availability check ───────────────────────────────────────
+    _, _last_day = calendar.monthrange(sel_year, sel_month)
+    _month_start = date(sel_year, sel_month, 1)
+    _month_end = date(sel_year, sel_month, _last_day)
+    _avail_emps = [
+        e for e in employees
+        if e.availability_start <= _month_end and e.availability_end >= _month_start
+    ]
+    if not _avail_emps:
+        _emp_years = sorted({e.availability_start.year for e in employees})
+        st.error(
+            f"⛔ **No employees are available in {SEASON_MONTHS[sel_month]} {sel_year}.** "
+            f"Employee availability covers: {_emp_years}. "
+            "Update availability dates on the Employees page before generating."
+        )
+    elif not ships:
+        st.warning(
+            f"⚠️ **No cruise ship arrivals for {SEASON_MONTHS[sel_month]} {sel_year}.** "
+            "Upload ship data on the Cruise Ships page — generating without ships may produce an empty schedule."
+        )
+
     with col_gen:
         st.write("")  # spacing
         generate_clicked = st.button("🔄 Generate Schedule", type="primary", use_container_width=True)
@@ -231,6 +265,12 @@ with main_col:
 
     # ── Generate ──────────────────────────────────────────────────────────────
     if generate_clicked:
+        if not _avail_emps:
+            st.error("Cannot generate: no employees are available for this month. Fix availability dates first.")
+        elif not ships:
+            st.warning("Generating without ship data — demand will be minimal (base staffing only).")
+
+    if generate_clicked and _avail_emps:
         with st.spinner(f"Generating {SEASON_MONTHS[sel_month]} {sel_year} schedule (up to 60s)…"):
             try:
                 demand = generate_monthly_demand(sel_year, sel_month, ships)
@@ -310,21 +350,31 @@ with main_col:
         else:
             st.divider()
 
+            # Flash banner when LLM Apply updates the grid
+            if "_apply_flash" in st.session_state:
+                st.success(f"✅ {st.session_state.pop('_apply_flash')} — schedule grid updated below")
+
             # ── Action buttons ────────────────────────────────────────────────
+            _is_approved = schedule.status == ScheduleStatus.approved
+            st.info(
+                "💾 **Save Draft** to keep editing later.  "
+                "🏁 **Approve & Finalize** to lock the schedule.  "
+                "📊 **Export** is available after approval.",
+                icon="ℹ️",
+            )
             act1, act2, act3, act4 = st.columns(4)
             status_label = schedule.status.value.upper()
 
             with act1:
-                if st.button("💾 Save Draft", use_container_width=True):
+                if st.button("💾 Save Draft", use_container_width=True, disabled=_is_approved):
                     if save_schedule_to_db(schedule):
-                        st.success("Schedule saved as draft.")
+                        st.success("Saved as draft — you can keep editing.")
 
             with act2:
-                if schedule.status != ScheduleStatus.approved:
-                    if st.button("✅ Approve", use_container_width=True, type="primary"):
+                if not _is_approved:
+                    if st.button("🏁 Approve & Finalize", use_container_width=True, type="primary"):
                         if save_schedule_to_db(schedule):
                             if approve_schedule_in_db(schedule.id):
-                                # Update session state status
                                 updated = ScheduleRead(
                                     id=schedule.id, month=schedule.month, year=schedule.year,
                                     status=ScheduleStatus.approved,
@@ -333,18 +383,22 @@ with main_col:
                                     assignments=schedule.assignments,
                                 )
                                 st.session_state["current_schedule"] = updated
-                                st.success("Schedule approved!")
+                                st.success("✅ Schedule approved and finalized!")
                                 st.rerun()
                 else:
-                    st.info("✅ Approved")
+                    st.success("✅ Approved & finalized")
 
             with act3:
-                if st.button("📊 Export →", use_container_width=True):
+                if st.button(
+                    "📊 Export →",
+                    use_container_width=True,
+                    disabled=not _is_approved,
+                    help="Approve the schedule first to enable export." if not _is_approved else None,
+                ):
                     st.info("Use the Export page in the sidebar to download the schedule.")
 
             with act4:
                 if st.button("🔄 Regenerate", use_container_width=True):
-                    # Clear current and regenerate
                     st.session_state.pop("current_schedule", None)
                     st.session_state.pop("current_demand", None)
                     st.rerun()

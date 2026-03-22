@@ -22,6 +22,7 @@ from src.solver.constraints import (
     add_daily_rest,
     add_daily_staffing_requirements,
     add_one_shift_per_day,
+    add_opening_hours_coverage,
     add_role_capability,
     add_weekly_hour_limits,
     add_weekly_rest,
@@ -91,6 +92,10 @@ class ScheduleGenerator:
 
     def build_model(self) -> None:
         """Build the complete CP-SAT model: variables + hard + soft constraints."""
+        # Load establishment settings if not provided — needed for coverage constraints
+        if self.settings is None:
+            self.settings = self._load_settings()
+
         self._create_variables()
         self._pre_flight_checks()
         self._add_hard_constraints()
@@ -269,12 +274,45 @@ class ScheduleGenerator:
         add_eidsdal_transport_constraints(
             self.model, self.variables, self.employees, self.shifts, self._days
         )
+        settings_list = self.settings if isinstance(self.settings, list) else (
+            [self.settings] if self.settings else []
+        )
+        add_opening_hours_coverage(
+            self.model, self.variables, self.employees, self.shifts,
+            self._days, self._demand_map, settings_list,
+        )
 
     def _add_soft_constraints(self) -> None:
         add_soft_constraints(
             self.model, self.variables, self.employees, self.shifts,
             self._days, self._demand_map,
         )
+
+    @staticmethod
+    def _load_settings() -> list[EstablishmentSettingsRead]:
+        """Load all EstablishmentSettings rows from DB. Returns empty list on error."""
+        try:
+            from src.db.database import db_session
+            from src.models.establishment import EstablishmentSettingsORM
+            from src.models.enums import Season as SeasonEnum
+
+            with db_session() as db:
+                rows = db.query(EstablishmentSettingsORM).all()
+                return [
+                    EstablishmentSettingsRead(
+                        id=r.id,
+                        season=SeasonEnum(r.season),
+                        date_range_start=r.date_range_start,
+                        date_range_end=r.date_range_end,
+                        opening_time=r.opening_time,
+                        closing_time=r.closing_time,
+                        production_start=r.production_start,
+                    )
+                    for r in rows
+                ]
+        except Exception as exc:
+            logger.warning("Could not load EstablishmentSettings: %s", exc)
+            return []
 
     # ── Diagnostics (private) ─────────────────────────────────────────────────
 
