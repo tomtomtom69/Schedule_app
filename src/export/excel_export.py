@@ -95,13 +95,19 @@ def export_schedule_to_excel(
     half1 = [d for d in all_days if d.day <= 15]
     half2 = [d for d in all_days if d.day > 15]
 
+    def _role_val(e):
+        return e.role_capability.value if hasattr(e.role_capability, 'value') else str(e.role_capability)
+
+    def _housing_val(e):
+        return e.housing.value if hasattr(e.housing, 'value') else str(e.housing)
+
     prod_emps = sorted(
-        [e for e in employees if e.role_capability in ("production", "both")],
-        key=lambda e: (e.housing == "eidsdal", e.name),
+        [e for e in employees if _role_val(e) in ("production", "both")],
+        key=lambda e: (_housing_val(e) == "eidsdal", e.name),
     )
     cafe_emps = sorted(
-        [e for e in employees if e.role_capability == "cafe"],
-        key=lambda e: (e.housing == "eidsdal", e.name),
+        [e for e in employees if _role_val(e) == "cafe"],
+        key=lambda e: (_housing_val(e) == "eidsdal", e.name),
     )
 
     wb = openpyxl.Workbook()
@@ -247,8 +253,10 @@ def _write_employee_row(
     assign_map: dict,
     shift_map: dict,
 ) -> int:
-    is_eidsdal = emp.housing == "eidsdal"
-    is_pt = emp.employment_type == "part_time"
+    _h = emp.housing.value if hasattr(emp.housing, 'value') else str(emp.housing)
+    _t = emp.employment_type.value if hasattr(emp.employment_type, 'value') else str(emp.employment_type)
+    is_eidsdal = _h == "eidsdal"
+    is_pt = _t == "part_time"
     name = emp.name + (" 🏔" if is_eidsdal else "") + (" 🚗" if emp.driving_licence else "")
 
     name_cell = ws.cell(row=row, column=1, value=name)
@@ -422,8 +430,13 @@ def _write_summary_sheet(
         contracted = emp.contracted_hours * 4.33
         overtime = max(0.0, total_h - contracted)
 
+        role_str = emp.role_capability.value if hasattr(emp.role_capability, 'value') else str(emp.role_capability)
+        type_str = emp.employment_type.value if hasattr(emp.employment_type, 'value') else str(emp.employment_type)
+        # Convert to display-friendly strings
+        role_display = role_str.replace("_", " ").title()
+        type_display = type_str.replace("_", " ").replace("full time", "Full-time").replace("part time", "Part-time")
         values = [
-            emp.name, emp.role_capability, emp.employment_type,
+            emp.name, role_display, type_display,
             days_worked, days_off,
             round(total_h, 1), round(contracted, 0), round(overtime, 1),
         ]

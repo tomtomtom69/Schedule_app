@@ -39,7 +39,7 @@ st.markdown(
     **Pages:**
     - **Settings** — Configure seasons, opening hours, and shift templates
     - **Employees** — Upload and manage employee data
-    - **Cruise Ships** — Upload cruise schedules and ship-language mappings
+    - **Cruise Ships** — Upload cruise schedules (language from Språk column)
     - **Schedule** — Generate and edit monthly schedules
     - **Export** — Download schedules as Excel or PDF
     """

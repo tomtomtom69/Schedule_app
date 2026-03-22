@@ -10,7 +10,7 @@ import streamlit as st
 
 from src.db.database import db_session
 from src.demand.forecaster import DailyDemand, generate_monthly_demand
-from src.models.cruise_ship import CruiseShipORM, CruiseShipRead, ShipLanguageORM
+from src.models.cruise_ship import CruiseShipORM, CruiseShipRead
 from src.models.employee import EmployeeORM, EmployeeRead
 from src.models.enums import ScheduleStatus
 from src.models.schedule import AssignmentORM, AssignmentRead, ScheduleORM, ScheduleRead
@@ -58,17 +58,14 @@ def load_shifts() -> list[ShiftTemplateRead]:
 
 
 @st.cache_data(ttl=60)
-def load_ships_for_month(year: int, month: int) -> tuple[list[CruiseShipRead], dict[str, str]]:
+def load_ships_for_month(year: int, month: int) -> list[CruiseShipRead]:
     with db_session() as db:
         _, last_day = calendar.monthrange(year, month)
         rows = db.query(CruiseShipORM).filter(
             CruiseShipORM.date >= date(year, month, 1),
             CruiseShipORM.date <= date(year, month, last_day),
         ).all()
-        lang_rows = db.query(ShipLanguageORM).all()
-        lang_map = {r.ship_name: r.primary_language for r in lang_rows}
-
-        ship_reads = [
+        return [
             CruiseShipRead(
                 id=r.id, ship_name=r.ship_name, date=r.date,
                 arrival_time=r.arrival_time, departure_time=r.departure_time,
@@ -77,7 +74,6 @@ def load_ships_for_month(year: int, month: int) -> tuple[list[CruiseShipRead], d
             )
             for r in rows
         ]
-    return ship_reads, lang_map
 
 
 def load_saved_schedule(year: int, month: int) -> ScheduleRead | None:
@@ -214,7 +210,7 @@ with main_col:
     try:
         employees = load_employees()
         shifts = load_shifts()
-        ships, lang_map = load_ships_for_month(sel_year, sel_month)
+        ships = load_ships_for_month(sel_year, sel_month)
     except Exception as e:
         st.error(f"Failed to load data from database: {e}")
         st.stop()
@@ -235,41 +231,63 @@ with main_col:
 
     # ── Generate ──────────────────────────────────────────────────────────────
     if generate_clicked:
-        with st.spinner(f"Generating {SEASON_MONTHS[sel_month]} {sel_year} schedule (up to 30s)…"):
+        with st.spinner(f"Generating {SEASON_MONTHS[sel_month]} {sel_year} schedule (up to 60s)…"):
             try:
-                demand = generate_monthly_demand(sel_year, sel_month, ships, lang_map)
+                demand = generate_monthly_demand(sel_year, sel_month, ships)
                 if not demand:
                     st.error("No demand generated — check that the selected month is within the operating season (May–October).")
                 else:
                     gen = ScheduleGenerator(employees, demand, shifts)
                     gen.build_model()
                     result = gen.solve()
+                    info = gen.solve_info
+
+                    # ── Always show solver diagnostics panel ───────────────
+                    with st.expander("🔍 Solver diagnostics", expanded=(result is None)):
+                        cols = st.columns(4)
+                        cols[0].metric("Status", info.status_name)
+                        cols[1].metric("Variables", f"{info.num_variables:,}")
+                        cols[2].metric("Available employees", info.num_employees_available)
+                        cols[3].metric("Working shifts", info.num_working_assignments)
+                        if info.wall_time > 0:
+                            st.caption(f"Solver wall time: {info.wall_time:.2f}s  |  "
+                                       f"Days in month: {info.num_days}  |  "
+                                       f"Objective: {info.objective_value:.0f}")
+                        if info.warnings:
+                            st.markdown("**⚠️ Warnings:**")
+                            for w in info.warnings:
+                                st.warning(w)
+                        if info.diagnostics:
+                            st.markdown("**❌ Issues:**")
+                            for d_msg in info.diagnostics:
+                                st.error(d_msg)
 
                     if result is None:
                         st.error(
-                            "Solver could not find a feasible schedule. "
-                            "Check that staffing requirements can be met with current employees. "
-                            "Common causes: insufficient Eidsdal drivers, missing language speakers, "
-                            "or too few employees for demand."
+                            f"**Schedule generation failed** (solver status: `{info.status_name}`).  \n"
+                            "See the diagnostics panel above for details."
                         )
                     else:
                         st.session_state["current_schedule"] = result
                         st.session_state["current_demand"] = demand
                         st.session_state["schedule_year"] = sel_year
                         st.session_state["schedule_month"] = sel_month
+                        n_working = sum(1 for a in result.assignments if not a.is_day_off)
                         st.success(
-                            f"Schedule generated! "
-                            f"{sum(1 for a in result.assignments if not a.is_day_off)} working assignments "
-                            f"across {len(demand)} days."
+                            f"✅ Schedule generated!  \n"
+                            f"**{n_working}** working assignments across **{len(demand)}** days  \n"
+                            f"Status: `{info.status_name}` — wall time: {info.wall_time:.1f}s"
                         )
             except Exception as e:
                 st.error(f"Generation failed: {e}")
+                import traceback
+                st.code(traceback.format_exc(), language="text")
 
     # ── Load saved ────────────────────────────────────────────────────────────
     if load_clicked:
         saved = load_saved_schedule(sel_year, sel_month)
         if saved:
-            demand = generate_monthly_demand(sel_year, sel_month, ships, lang_map)
+            demand = generate_monthly_demand(sel_year, sel_month, ships)
             st.session_state["current_schedule"] = saved
             st.session_state["current_demand"] = demand
             st.session_state["schedule_year"] = sel_year

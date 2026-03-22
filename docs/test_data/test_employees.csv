@@ -1,0 +1,11 @@
+name,languages,role_capability,employment_type,contracted_hours,housing,driving_licence,availability_start,availability_end
+Aina Haugen,"english,spanish",both,full_time,37.5,eidsdal,true,2026-05-01,2026-10-15
+Erik Bakke,"english,german",cafe,full_time,37.5,geiranger,false,2026-05-01,2026-10-15
+Maria Nilsen,"english,italian",cafe,full_time,37.5,eidsdal,true,2026-06-01,2026-09-30
+Lars Dahl,english,production,full_time,37.5,eidsdal,false,2026-05-01,2026-10-15
+Sofia Berg,"english,spanish",cafe,part_time,20.0,geiranger,false,2026-06-15,2026-08-31
+Hans Pedersen,"english,german",production,full_time,37.5,geiranger,false,2026-05-01,2026-10-15
+Ingrid Lund,"english,french",cafe,full_time,37.5,geiranger,false,2026-05-01,2026-10-15
+Bjorn Olsen,english,both,full_time,37.5,eidsdal,true,2026-05-15,2026-09-30
+Eva Strand,"english,italian",cafe,part_time,20.0,geiranger,false,2026-07-01,2026-08-31
+Tor Hansen,english,production,full_time,37.5,geiranger,false,2026-05-01,2026-10-15

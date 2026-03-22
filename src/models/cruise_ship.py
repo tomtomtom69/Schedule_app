@@ -43,9 +43,11 @@ class CruiseShipBase(BaseModel):
     @field_validator("extra_language")
     @classmethod
     def normalise_language(cls, v: str | None) -> str | None:
-        if v is not None:
-            return v.lower().strip()
-        return v
+        if v is None:
+            return v
+        # Normalise each comma-separated language token
+        parts = [p.lower().strip() for p in v.split(",") if p.strip()]
+        return ",".join(parts) if parts else None
 
 
 class CruiseShipCreate(CruiseShipBase):
@@ -53,26 +55,6 @@ class CruiseShipCreate(CruiseShipBase):
 
 
 class CruiseShipRead(CruiseShipBase):
-    id: uuid.UUID
-
-    model_config = {"from_attributes": True}
-
-
-class ShipLanguageBase(BaseModel):
-    ship_name: str
-    primary_language: str
-
-    @field_validator("primary_language")
-    @classmethod
-    def normalise_language(cls, v: str) -> str:
-        return v.lower().strip()
-
-
-class ShipLanguageCreate(ShipLanguageBase):
-    pass
-
-
-class ShipLanguageRead(ShipLanguageBase):
     id: uuid.UUID
 
     model_config = {"from_attributes": True}
@@ -93,11 +75,3 @@ class CruiseShipORM(Base):
     size = Column(String, nullable=False)
     good_ship = Column(Boolean, nullable=False, default=False)
     extra_language = Column(String, nullable=True)
-
-
-class ShipLanguageORM(Base):
-    __tablename__ = "ship_languages"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    ship_name = Column(String, nullable=False, unique=True)
-    primary_language = Column(String, nullable=False)

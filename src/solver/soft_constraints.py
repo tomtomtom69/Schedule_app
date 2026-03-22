@@ -6,11 +6,12 @@ from ortools.sat.python import cp_model
 from src.demand.forecaster import DailyDemand
 from src.models.employee import EmployeeRead
 from src.models.shift_template import ShiftTemplateRead
-from src.models.enums import EmploymentType, Housing
+from src.models.enums import EmploymentType, Housing, ShiftRole
 
 Variables = dict[tuple, cp_model.IntVar]  # (employee_id, date, shift_id) -> BoolVar
 
 WEIGHTS = {
+    "language_coverage": 100,   # highest priority soft constraint
     "full_time_preference": 10,
     "eidsdal_grouping": 8,
     "employee_preferences": 5,
@@ -50,6 +51,11 @@ def add_soft_constraints(
     obj_vars: list[cp_model.IntVar] = []
     obj_coeffs: list[int] = []
 
+    # Language coverage is high-priority soft (was previously a hard constraint that
+    # caused infeasibility when no speaker was available for a given ship day).
+    if demand_map:
+        prefer_language_coverage(model, variables, employees, shifts, days, demand_map, obj_vars, obj_coeffs)
+
     prefer_full_time(model, variables, employees, shifts, days, obj_vars, obj_coeffs)
     group_eidsdal_shifts(model, variables, employees, shifts, days, obj_vars, obj_coeffs)
     respect_preferences(model, variables, employees, shifts, days, obj_vars, obj_coeffs)
@@ -58,6 +64,52 @@ def add_soft_constraints(
 
     if obj_vars:
         model.Maximize(cp_model.LinearExpr.WeightedSum(obj_vars, obj_coeffs))
+
+
+def prefer_language_coverage(
+    model: cp_model.CpModel,
+    variables: Variables,
+    employees: list[EmployeeRead],
+    shifts: list[ShiftTemplateRead],
+    days: list[date],
+    demand_map: dict[date, DailyDemand],
+    obj_vars: list,
+    obj_coeffs: list,
+) -> None:
+    """Soft language coverage: reward having a speaker on café when a ship language is required.
+
+    For each (day, required_language): if at least one speaker is on a café shift,
+    a binary reward var is 1 (gaining weight LANGUAGE_COVERAGE). If no speaker is
+    available at all for a given language/day, the constraint is simply skipped so the
+    model stays feasible.
+    """
+    w = WEIGHTS["language_coverage"]
+    cafe_shifts = [s for s in shifts if s.role == ShiftRole.cafe]
+
+    for d in days:
+        dd = demand_map.get(d)
+        if not dd or not dd.languages_required:
+            continue
+        for lang in dd.languages_required:
+            speakers = [
+                emp for emp in employees
+                if any(l.lower().strip() == lang.lower() for l in emp.languages)
+            ]
+            lang_vars = [
+                variables[(emp.id, d, s.id)]
+                for emp in speakers
+                for s in cafe_shifts
+                if (emp.id, d, s.id) in variables
+            ]
+            if not lang_vars:
+                continue  # no speaker available — skip silently (preflight warns the user)
+
+            # covered = 1 if at least one speaker is scheduled on a café shift
+            covered = model.NewBoolVar(f"lang_cov_{lang}_{d}")
+            model.Add(sum(lang_vars) >= 1).OnlyEnforceIf(covered)
+            model.Add(sum(lang_vars) == 0).OnlyEnforceIf(covered.Not())
+            obj_vars.append(covered)
+            obj_coeffs.append(w)
 
 
 def prefer_full_time(

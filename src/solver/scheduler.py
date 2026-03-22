@@ -4,7 +4,9 @@ Orchestrates the CP-SAT model build, solve, and result extraction.
 """
 import logging
 import uuid
+from dataclasses import dataclass, field
 from datetime import date, datetime
+from typing import Optional
 
 from ortools.sat.python import cp_model
 
@@ -19,7 +21,6 @@ from src.solver.constraints import (
     add_availability,
     add_daily_rest,
     add_daily_staffing_requirements,
-    add_language_requirements,
     add_one_shift_per_day,
     add_role_capability,
     add_weekly_hour_limits,
@@ -30,7 +31,30 @@ from src.solver.transport import add_eidsdal_transport_constraints
 
 logger = logging.getLogger(__name__)
 
-_SOLVER_TIMEOUT_SECONDS = 30
+_SOLVER_TIMEOUT_SECONDS = 60
+
+
+@dataclass
+class SolveInfo:
+    """Diagnostic information from the most recent solve() call."""
+    status_name: str = "NOT_RUN"
+    num_variables: int = 0
+    num_days: int = 0
+    num_employees_available: int = 0
+    num_working_assignments: int = 0
+    wall_time: float = 0.0
+    objective_value: float = 0.0
+    diagnostics: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def is_success(self) -> bool:
+        return self.status_name in ("OPTIMAL", "FEASIBLE") and self.num_working_assignments > 0
+
+    @property
+    def is_empty_solution(self) -> bool:
+        """True if solver said OK but produced zero working shifts."""
+        return self.status_name in ("OPTIMAL", "FEASIBLE") and self.num_working_assignments == 0
 
 
 class ScheduleGenerator:
@@ -41,6 +65,7 @@ class ScheduleGenerator:
         gen = ScheduleGenerator(employees, demand, shift_templates, settings)
         gen.build_model()
         schedule = gen.solve()   # returns ScheduleRead or None if infeasible
+        info = gen.solve_info    # SolveInfo with diagnostics
     """
 
     def __init__(
@@ -56,6 +81,7 @@ class ScheduleGenerator:
         self.settings = settings
         self.model = cp_model.CpModel()
         self.variables: Variables = {}
+        self.solve_info = SolveInfo()
 
         # Derived state populated during build
         self._days: list[date] = sorted(d.date for d in demand)
@@ -66,46 +92,84 @@ class ScheduleGenerator:
     def build_model(self) -> None:
         """Build the complete CP-SAT model: variables + hard + soft constraints."""
         self._create_variables()
+        self._pre_flight_checks()
         self._add_hard_constraints()
         self._add_soft_constraints()
-        logger.info(
-            "Model built: %d variables, %d days, %d employees, %d shift templates",
-            len(self.variables),
-            len(self._days),
-            len(self.employees),
-            len(self.shifts),
-        )
 
-    def solve(self) -> ScheduleRead | None:
+        n_vars = len(self.variables)
+        n_days = len(self._days)
+        n_emps = len(self.employees)
+        n_avail = self._count_available_employees()
+        logger.info(
+            "Model built: %d variables, %d days, %d employees (%d available this month), %d shifts",
+            n_vars, n_days, n_emps, n_avail, len(self.shifts),
+        )
+        self.solve_info.num_variables = n_vars
+        self.solve_info.num_days = n_days
+        self.solve_info.num_employees_available = n_avail
+
+    def solve(self) -> Optional[ScheduleRead]:
         """Solve the model and return a ScheduleRead, or None if infeasible/timeout."""
+        if len(self.variables) == 0:
+            msg = (
+                "No scheduling variables created — this means no employee is available "
+                f"during the selected month. "
+                f"Check employee availability dates (currently covering: "
+                f"{self._availability_summary()})."
+            )
+            self.solve_info.status_name = "NO_VARIABLES"
+            self.solve_info.diagnostics.append(msg)
+            logger.error(msg)
+            return None
+
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = _SOLVER_TIMEOUT_SECONDS
         solver.parameters.log_search_progress = False
 
-        logger.info("Starting CP-SAT solve (timeout=%ds)…", _SOLVER_TIMEOUT_SECONDS)
+        logger.info("Starting CP-SAT solve (timeout=%ds, variables=%d)…",
+                    _SOLVER_TIMEOUT_SECONDS, len(self.variables))
         status = solver.Solve(self.model)
-        logger.info("Solver status: %s", solver.StatusName(status))
+        status_name = solver.StatusName(status)
+        logger.info("Solver status: %s  |  wall time: %.2fs", status_name, solver.WallTime())
+
+        self.solve_info.status_name = status_name
+        self.solve_info.wall_time = solver.WallTime()
 
         if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            logger.info(
-                "Objective value: %.0f  |  wall time: %.2fs",
-                solver.ObjectiveValue(),
-                solver.WallTime(),
-            )
-            return self._extract_schedule(solver)
+            self.solve_info.objective_value = solver.ObjectiveValue()
+            schedule = self._extract_schedule(solver)
+            working = sum(1 for a in schedule.assignments if not a.is_day_off)
+            self.solve_info.num_working_assignments = working
+            logger.info("Objective: %.0f | working assignments: %d", solver.ObjectiveValue(), working)
 
-        logger.warning("No feasible solution found (status=%s)", solver.StatusName(status))
+            if working == 0:
+                msg = (
+                    "Solver returned a feasible solution but assigned ZERO working shifts. "
+                    "All hard constraints were trivially satisfied (no variables active). "
+                    "Most likely cause: employee availability dates do not overlap with the "
+                    f"scheduled month. Availability window summary: {self._availability_summary()}."
+                )
+                self.solve_info.diagnostics.append(msg)
+                logger.warning(msg)
+                return None
+
+            return schedule
+
+        # Infeasible or unknown
+        self.solve_info.diagnostics.extend(self._generate_infeasibility_hints())
+        if status == cp_model.INFEASIBLE:
+            logger.error("Model is INFEASIBLE. %s", "; ".join(self.solve_info.diagnostics))
+        elif status == cp_model.UNKNOWN:
+            logger.warning("Solver timed out after %.1fs without finding a solution.", solver.WallTime())
+            self.solve_info.diagnostics.insert(0,
+                f"Solver timed out after {solver.WallTime():.0f}s. "
+                "Try reducing the month or simplifying constraints.")
         return None
 
     # ── Model building (private) ─────────────────────────────────────────────
 
     def _create_variables(self) -> None:
-        """Create one BoolVar per compatible (employee, day, shift) triple.
-
-        Skips combinations where:
-        - Employee is not available on that date
-        - Shift role doesn't match employee's role_capability
-        """
+        """Create one BoolVar per compatible (employee, day, shift) triple."""
         for emp in self.employees:
             for d in self._days:
                 if not (emp.availability_start <= d <= emp.availability_end):
@@ -119,30 +183,87 @@ class ScheduleGenerator:
 
     @staticmethod
     def _shift_compatible(emp: EmployeeRead, shift: ShiftTemplateRead) -> bool:
-        """Return True if the employee's role_capability allows this shift."""
         if emp.role_capability == RoleCapability.cafe:
             return shift.role == ShiftRole.cafe
         if emp.role_capability == RoleCapability.production:
             return shift.role == ShiftRole.production
-        # RoleCapability.both: any shift
         return True
 
+    def _pre_flight_checks(self) -> None:
+        """Run sanity checks and populate warnings before solving."""
+        if not self._days:
+            self.solve_info.warnings.append("No demand days found for selected month/season.")
+            return
+
+        month_start = self._days[0]
+        month_end = self._days[-1]
+
+        # Check employees who have NO availability overlap with this month
+        unavailable = [
+            e.name for e in self.employees
+            if e.availability_end < month_start or e.availability_start > month_end
+        ]
+        if unavailable:
+            self.solve_info.warnings.append(
+                f"{len(unavailable)} employee(s) have availability dates that don't overlap "
+                f"with {month_start.strftime('%B %Y')}: {', '.join(unavailable[:5])}"
+                + (f" ... and {len(unavailable)-5} more" if len(unavailable) > 5 else "")
+            )
+
+        # Check language coverage gaps
+        demand_langs: dict[str, list[date]] = {}
+        for d in self._days:
+            dd = self._demand_map.get(d)
+            if dd:
+                for lang in dd.languages_required:
+                    demand_langs.setdefault(lang, []).append(d)
+
+        for lang, days in demand_langs.items():
+            speakers = [
+                e for e in self.employees
+                if any(l.lower().strip() == lang for l in e.languages)
+                and e.availability_start <= days[0] <= e.availability_end
+            ]
+            if not speakers:
+                self.solve_info.warnings.append(
+                    f"No '{lang}' speaker found among available employees — "
+                    f"language requirement on {len(days)} day(s) will be treated as soft."
+                )
+
+        # Check staffing capacity
+        cafe_emps_count = sum(
+            1 for e in self.employees
+            if e.role_capability in (RoleCapability.cafe, RoleCapability.both)
+            and e.availability_start <= month_start <= e.availability_end
+        )
+        prod_emps_count = sum(
+            1 for e in self.employees
+            if e.role_capability in (RoleCapability.production, RoleCapability.both)
+            and e.availability_start <= month_start <= e.availability_end
+        )
+        max_cafe = max((self._demand_map[d].cafe_needed for d in self._days if d in self._demand_map), default=0)
+        max_prod = max((self._demand_map[d].production_needed for d in self._days if d in self._demand_map), default=0)
+        if cafe_emps_count < max_cafe:
+            self.solve_info.warnings.append(
+                f"Peak café demand is {max_cafe} but only {cafe_emps_count} café-capable "
+                "employee(s) are available at month start — may be infeasible."
+            )
+        if prod_emps_count < max_prod:
+            self.solve_info.warnings.append(
+                f"Peak production demand is {max_prod} but only {prod_emps_count} production-capable "
+                "employee(s) are available at month start — may be infeasible."
+            )
+
     def _add_hard_constraints(self) -> None:
-        """Add all hard constraints to the CP-SAT model."""
         add_one_shift_per_day(self.model, self.variables, self.employees, self.shifts, self._days)
         add_daily_staffing_requirements(
             self.model, self.variables, self._demand_map,
             self.employees, self.shifts, self._days,
         )
-        add_weekly_hour_limits(
-            self.model, self.variables, self.employees, self.shifts, self._days
-        )
+        add_weekly_hour_limits(self.model, self.variables, self.employees, self.shifts, self._days)
         add_daily_rest(self.model, self.variables, self.employees, self.shifts, self._days)
         add_weekly_rest(self.model, self.variables, self.employees, self.shifts, self._days)
-        add_language_requirements(
-            self.model, self.variables, self._demand_map,
-            self.employees, self.shifts, self._days,
-        )
+        # NOTE: language matching is now a SOFT constraint (see soft_constraints.py)
         add_role_capability(self.model, self.variables, self.employees, self.shifts)
         add_availability(self.model, self.variables, self.employees, self._days)
         add_eidsdal_transport_constraints(
@@ -150,20 +271,84 @@ class ScheduleGenerator:
         )
 
     def _add_soft_constraints(self) -> None:
-        """Add the weighted objective function (soft constraints)."""
         add_soft_constraints(
             self.model, self.variables, self.employees, self.shifts,
             self._days, self._demand_map,
         )
 
+    # ── Diagnostics (private) ─────────────────────────────────────────────────
+
+    def _count_available_employees(self) -> int:
+        if not self._days:
+            return 0
+        month_start, month_end = self._days[0], self._days[-1]
+        return sum(
+            1 for e in self.employees
+            if not (e.availability_end < month_start or e.availability_start > month_end)
+        )
+
+    def _availability_summary(self) -> str:
+        if not self.employees:
+            return "no employees"
+        starts = [e.availability_start for e in self.employees]
+        ends = [e.availability_end for e in self.employees]
+        return f"{min(starts)} – {max(ends)}"
+
+    def _generate_infeasibility_hints(self) -> list[str]:
+        hints = []
+        if not self._days:
+            return ["No demand days — is the selected month within the operating season (May–Oct)?"]
+
+        month_start = self._days[0]
+
+        # Check language coverage
+        for d in self._days:
+            dd = self._demand_map.get(d)
+            if not dd:
+                continue
+            for lang in dd.languages_required:
+                speakers_on_day = [
+                    e for e in self.employees
+                    if any(l.lower().strip() == lang for l in e.languages)
+                    and (e.id, d, next(
+                        (s.id for s in self.shifts if s.role == ShiftRole.cafe), None
+                    )) in self.variables
+                ]
+                if not speakers_on_day:
+                    hints.append(
+                        f"{d}: no '{lang}' speaker available for café — "
+                        "add a speaker or make language matching soft."
+                    )
+
+        # Summarise production gap
+        prod_emps = [
+            e for e in self.employees
+            if e.role_capability in (RoleCapability.production, RoleCapability.both)
+            and e.availability_start <= month_start <= e.availability_end
+        ]
+        max_prod = max(
+            (self._demand_map[d].production_needed for d in self._days if d in self._demand_map),
+            default=0,
+        )
+        if len(prod_emps) < max_prod:
+            hints.append(
+                f"Production shortfall: peak demand={max_prod} but only "
+                f"{len(prod_emps)} production-capable employee(s) available."
+            )
+
+        if not hints:
+            hints.append(
+                "Constraints conflict — most likely weekly rest + staffing minimums + "
+                "limited employees over a full month. Consider reducing staffing minimums "
+                "or adding more employees."
+            )
+        return hints
+
     # ── Solution extraction (private) ────────────────────────────────────────
 
     def _extract_schedule(self, solver: cp_model.CpSolver) -> ScheduleRead:
-        """Read solver values and build a ScheduleRead with all assignments."""
         schedule_id = uuid.uuid4()
         assignments: list[AssignmentRead] = []
-
-        # Track which (emp, day) combinations have working shifts
         emp_day_worked: set[tuple] = set()
 
         for (emp_id, d, shift_id), var in self.variables.items():
@@ -178,7 +363,6 @@ class ScheduleGenerator:
                 ))
                 emp_day_worked.add((emp_id, d))
 
-        # Add explicit day-off records for available employees not assigned
         for emp in self.employees:
             for d in self._days:
                 if not (emp.availability_start <= d <= emp.availability_end):
@@ -193,7 +377,6 @@ class ScheduleGenerator:
                         is_day_off=True,
                     ))
 
-        # Determine month/year from demand
         if self._days:
             month = self._days[0].month
             year = self._days[0].year

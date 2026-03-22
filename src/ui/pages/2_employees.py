@@ -13,6 +13,23 @@ from src.models.employee import EmployeeORM, EmployeeRead
 st.set_page_config(page_title="Employees", page_icon="👥", layout="wide")
 st.title("👥 Employees")
 
+# ── Unsaved data warning ──────────────────────────────────────────────────────
+_unsaved = st.session_state.get("employees_unsaved", 0)
+if _unsaved:
+    st.warning(
+        f"⚠️ **{_unsaved} employee(s) parsed but NOT yet saved.** "
+        "Go to the **Upload CSV** tab and click **Save to Database** to keep your data.",
+        icon="⚠️",
+    )
+    st.components.v1.html(
+        "<script>"
+        "window.parent.onbeforeunload = function() {"
+        "  return 'You have unsaved employee data. Are you sure you want to leave?';"
+        "};"
+        "</script>",
+        height=0,
+    )
+
 tab_view, tab_edit, tab_upload = st.tabs(["Employee List", "Edit Employee", "Upload CSV"])
 
 
@@ -238,6 +255,7 @@ with tab_upload:
                 st.write(f"- Row {err['row']}: {err['error']}")
 
         if records:
+            st.session_state["employees_unsaved"] = len(records)
             st.success(f"{len(records)} employee(s) parsed successfully.")
 
             warnings = validate_employee_list(records)
@@ -265,19 +283,43 @@ with tab_upload:
                 horizontal=True,
             )
 
-            if st.button("Save to Database", type="primary"):
-                try:
-                    with db_session() as db:
-                        if "Replace" in import_mode:
-                            db.query(EmployeeORM).delete()
-                        for record in records:
-                            existing = db.query(EmployeeORM).filter_by(name=record.name).first()
-                            if existing:
-                                for field, value in record.model_dump().items():
-                                    setattr(existing, field, value)
-                            else:
-                                db.add(EmployeeORM(**record.model_dump()))
-                    st.success(f"Saved {len(records)} employees to database.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Save failed: {e}")
+            st.divider()
+            with st.container(border=True):
+                st.markdown(
+                    f"### 💾 Save {len(records)} Employee(s) to Database",
+                    help="This will write the previewed employees to the database.",
+                )
+                st.caption(
+                    "Mode: **Replace all**" if "Replace" in import_mode
+                    else "Mode: **Append / update by name**"
+                )
+                if st.button(
+                    f"✅ Save {len(records)} Employee(s) to Database",
+                    type="primary",
+                    use_container_width=True,
+                    key="save_employees_btn",
+                ):
+                    try:
+                        with db_session() as db:
+                            if "Replace" in import_mode:
+                                db.query(EmployeeORM).delete()
+                            for record in records:
+                                existing = db.query(EmployeeORM).filter_by(name=record.name).first()
+                                if existing:
+                                    for field, value in record.model_dump().items():
+                                        setattr(existing, field, value)
+                                else:
+                                    db.add(EmployeeORM(**record.model_dump()))
+                        st.session_state.pop("employees_unsaved", None)
+                        st.components.v1.html(
+                            "<script>window.parent.onbeforeunload = null;</script>",
+                            height=0,
+                        )
+                        st.success(
+                            f"✅ **{len(records)} employee(s) saved successfully!**  \n"
+                            "The Employee List tab now shows the updated data."
+                        )
+                        st.balloons()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Save failed: {e}")

@@ -5,23 +5,21 @@ from src.models.employee import EmployeeRead
 
 def get_required_languages(
     ships_on_date: list[CruiseShipRead],
-    ship_language_map: dict[str, str],  # ship_name → language
 ) -> list[str]:
     """Determine which extra languages are needed on a given day.
 
-    1. For each ship in port, use ship.extra_language if set;
-       otherwise look up in ship_language_map.
-    2. Filter out 'english' (spoken by everyone).
-    3. Return deduplicated, sorted list of required languages.
+    Reads extra_language directly from each ship record (may be a
+    comma-separated string like 'italian,spanish').
+    Filters out 'english' (spoken by everyone).
+    Returns a deduplicated, sorted list of required languages.
     """
     langs: set[str] = set()
     for ship in ships_on_date:
         if ship.extra_language:
-            lang = ship.extra_language.lower().strip()
-        else:
-            lang = ship_language_map.get(ship.ship_name, "").lower().strip()
-        if lang and lang != "english":
-            langs.add(lang)
+            for lang in ship.extra_language.split(","):
+                lang = lang.strip()
+                if lang and lang != "english":
+                    langs.add(lang)
     return sorted(langs)
 
 

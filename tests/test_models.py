@@ -4,7 +4,7 @@ from datetime import date, time
 from pydantic import ValidationError
 
 from src.models.employee import EmployeeCreate
-from src.models.cruise_ship import CruiseShipCreate, ShipLanguageCreate
+from src.models.cruise_ship import CruiseShipCreate
 from src.models.shift_template import ShiftTemplateCreate
 from src.models.establishment import EstablishmentSettingsCreate
 from src.models.schedule import ScheduleCreate, AssignmentCreate

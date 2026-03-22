@@ -1,19 +1,36 @@
-"""Cruise Ships page — upload schedules, language mappings, and view calendar."""
+"""Cruise Ships page — upload schedules and view calendar."""
 from __future__ import annotations
 
 import streamlit as st
 
 from src.db.database import db_session
-from src.ingestion.csv_parser import parse_cruise_ships_csv, parse_ship_languages_csv
+from src.ingestion.csv_parser import parse_cruise_ships_csv
 from src.ingestion.validators import validate_cruise_schedule
-from src.models.cruise_ship import CruiseShipORM, CruiseShipRead, ShipLanguageORM
+from src.models.cruise_ship import CruiseShipORM, CruiseShipRead
 from src.models.employee import EmployeeORM
 
 st.set_page_config(page_title="Cruise Ships", page_icon="🚢", layout="wide")
 st.title("🚢 Cruise Ships")
 
-tab_view, tab_calendar, tab_ships, tab_langs = st.tabs(
-    ["Ship List", "Calendar View", "Upload Ships CSV", "Upload Language Mapping"]
+# ── Unsaved data warning ──────────────────────────────────────────────────────
+_unsaved_ships = st.session_state.get("ships_unsaved", 0)
+if _unsaved_ships:
+    st.warning(
+        f"⚠️ **{_unsaved_ships} ship arrival(s)** parsed but NOT yet saved. "
+        "Go to the **Upload Ships CSV** tab and click Save to keep your data.",
+        icon="⚠️",
+    )
+    st.components.v1.html(
+        "<script>"
+        "window.parent.onbeforeunload = function() {"
+        "  return 'You have unsaved cruise ship data. Are you sure you want to leave?';"
+        "};"
+        "</script>",
+        height=0,
+    )
+
+tab_view, tab_calendar, tab_ships = st.tabs(
+    ["Ship List", "Calendar View", "Upload Ships CSV"]
 )
 
 
@@ -22,7 +39,6 @@ with tab_view:
     st.subheader("Cruise Ship Schedule")
     try:
         with db_session() as db:
-            langs = {r.ship_name: r.primary_language for r in db.query(ShipLanguageORM).all()}
             all_ship_data = [
                 {
                     "Date": s.date,
@@ -32,7 +48,7 @@ with tab_view:
                     "Departure": str(s.departure_time)[:5],
                     "Size": str(s.size),
                     "Good Ship": "⭐ Yes" if s.good_ship else "No",
-                    "Language": langs.get(s.ship_name, s.extra_language or "—"),
+                    "Language": s.extra_language or "—",
                     "_month": s.date.strftime("%Y-%m"),
                     "_good": s.good_ship,
                     "_geiranger": "geiranger" in str(s.port),
@@ -145,6 +161,7 @@ with tab_ships:
                 st.write(f"- Row {err['row']}: {err['error']}")
 
         if records:
+            st.session_state["ships_unsaved"] = len(records)
             st.success(f"{len(records)} ship arrival(s) parsed.")
 
             warnings = validate_cruise_schedule(records)
@@ -166,82 +183,43 @@ with tab_ships:
             ]
             st.dataframe(preview, use_container_width=True, hide_index=True)
 
-            if st.button("Save Ships to Database", type="primary"):
-                try:
-                    with db_session() as db:
-                        for record in records:
-                            data = record.model_dump()
-                            existing = (
-                                db.query(CruiseShipORM)
-                                .filter_by(ship_name=record.ship_name, date=record.date)
-                                .first()
-                            )
-                            if existing:
-                                for k, v in data.items():
-                                    setattr(existing, k, v)
-                            else:
-                                db.add(CruiseShipORM(**data))
-                    st.success(f"Saved {len(records)} ship arrivals.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Save failed: {e}")
+            st.divider()
+            with st.container(border=True):
+                st.markdown(
+                    f"### 🚢 Save {len(records)} Ship Arrival(s) to Database",
+                    help="Upserts by (ship_name, date) — existing records will be updated.",
+                )
+                if st.button(
+                    f"✅ Save {len(records)} Ship Arrival(s) to Database",
+                    type="primary",
+                    use_container_width=True,
+                    key="save_ships_btn",
+                ):
+                    try:
+                        with db_session() as db:
+                            for record in records:
+                                data = record.model_dump()
+                                existing = (
+                                    db.query(CruiseShipORM)
+                                    .filter_by(ship_name=record.ship_name, date=record.date)
+                                    .first()
+                                )
+                                if existing:
+                                    for k, v in data.items():
+                                        setattr(existing, k, v)
+                                else:
+                                    db.add(CruiseShipORM(**data))
+                        st.session_state.pop("ships_unsaved", None)
+                        st.components.v1.html(
+                            "<script>window.parent.onbeforeunload = null;</script>",
+                            height=0,
+                        )
+                        st.success(
+                            f"✅ **{len(records)} ship arrival(s) saved successfully!**  \n"
+                            "The Ship List tab now shows the updated schedule."
+                        )
+                        st.balloons()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Save failed: {e}")
 
-
-# ── Tab 4: Upload Language Mapping ────────────────────────────────────────────
-with tab_langs:
-    st.subheader("Upload Ship Language Mapping")
-    st.markdown(
-        """
-        **Required columns:** `ship_name, primary_language`
-
-        **Example:**
-        ```
-        ship_name,primary_language
-        Costa Diadema,italian
-        AIDA,german
-        ```
-        """
-    )
-
-    # Show current mapping
-    try:
-        with db_session() as db:
-            current_langs = [
-                {"Ship": r.ship_name, "Language": r.primary_language}
-                for r in db.query(ShipLanguageORM).order_by(ShipLanguageORM.ship_name).all()
-            ]
-        if current_langs:
-            st.caption(f"Current mappings: {len(current_langs)}")
-            import pandas as pd
-            st.dataframe(current_langs, use_container_width=True, hide_index=True)
-        else:
-            st.info("No language mappings stored yet.")
-    except Exception as e:
-        st.error(f"Could not load language mappings: {e}")
-
-    uploaded_langs = st.file_uploader("Choose file", type=["csv", "xlsx"], key="langs_upload")
-
-    if uploaded_langs:
-        records, errors = parse_ship_languages_csv(uploaded_langs)
-
-        if errors:
-            st.error(f"{len(errors)} row(s) failed validation:")
-            for err in errors:
-                st.write(f"- Row {err['row']}: {err['error']}")
-
-        if records:
-            st.success(f"{len(records)} language mapping(s) parsed.")
-
-            if st.button("Save Language Mappings", type="primary"):
-                try:
-                    with db_session() as db:
-                        for record in records:
-                            existing = db.query(ShipLanguageORM).filter_by(ship_name=record.ship_name).first()
-                            if existing:
-                                existing.primary_language = record.primary_language
-                            else:
-                                db.add(ShipLanguageORM(**record.model_dump()))
-                    st.success(f"Saved {len(records)} language mappings.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Save failed: {e}")

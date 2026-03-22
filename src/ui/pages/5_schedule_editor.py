@@ -10,7 +10,7 @@ import streamlit as st
 
 from src.db.database import db_session
 from src.demand.forecaster import DailyDemand, generate_monthly_demand
-from src.models.cruise_ship import CruiseShipORM, CruiseShipRead, ShipLanguageORM
+from src.models.cruise_ship import CruiseShipORM, CruiseShipRead
 from src.models.employee import EmployeeORM, EmployeeRead
 from src.models.enums import ScheduleStatus
 from src.models.schedule import AssignmentORM, AssignmentRead, ScheduleORM, ScheduleRead
@@ -56,14 +56,13 @@ def _load_shifts() -> list[ShiftTemplateRead]:
         ]
 
 
-def _load_ships(year: int, month: int) -> tuple[list[CruiseShipRead], dict[str, str]]:
+def _load_ships(year: int, month: int) -> list[CruiseShipRead]:
     _, last_day = calendar.monthrange(year, month)
     with db_session() as db:
         rows = db.query(CruiseShipORM).filter(
             CruiseShipORM.date >= date(year, month, 1),
             CruiseShipORM.date <= date(year, month, last_day),
         ).all()
-        lang_map = {r.ship_name: r.primary_language for r in db.query(ShipLanguageORM).all()}
         return [
             CruiseShipRead(
                 id=r.id, ship_name=r.ship_name, date=r.date,
@@ -72,7 +71,7 @@ def _load_ships(year: int, month: int) -> tuple[list[CruiseShipRead], dict[str, 
                 extra_language=r.extra_language,
             )
             for r in rows
-        ], lang_map
+        ]
 
 
 def _load_saved_schedule(year: int, month: int) -> ScheduleRead | None:
@@ -159,12 +158,12 @@ with main_col:
     try:
         employees = _load_employees()
         shifts = _load_shifts()
-        ships, lang_map = _load_ships(sel_year, sel_month)
+        ships = _load_ships(sel_year, sel_month)
     except Exception as e:
         st.error(f"Failed to load data: {e}")
         st.stop()
 
-    demand = generate_monthly_demand(sel_year, sel_month, ships, lang_map)
+    demand = generate_monthly_demand(sel_year, sel_month, ships)
 
     if load_btn:
         sched = _load_saved_schedule(sel_year, sel_month)

@@ -49,7 +49,6 @@ def calculate_daily_demand(
     d: date,
     ships_on_date: list[CruiseShipRead],
     season: Season,
-    ship_language_map: dict[str, str] | None = None,
 ) -> DailyDemand:
     """For a single day, calculate staffing needs.
 
@@ -58,12 +57,9 @@ def calculate_daily_demand(
     2. Calculate effective impact (Hellesylt = 0.5).
     3. Determine if any 'good_ship' is present.
     4. Look up staffing rule from STAFFING_RULES.
-    5. Collect required languages from ships.
+    5. Collect required languages from ship.extra_language fields.
     """
     from src.demand.language_matcher import get_required_languages
-
-    if ship_language_map is None:
-        ship_language_map = {}
 
     geiranger_count = sum(1 for s in ships_on_date if _is_geiranger(s.port))
     hellesylt_count = sum(1 for s in ships_on_date if s.port == Port.hellesylt)
@@ -80,7 +76,7 @@ def calculate_daily_demand(
     production_needed = rules["production"]
     cafe_needed = rules["cafe"]
 
-    languages_required = get_required_languages(ships_on_date, ship_language_map)
+    languages_required = get_required_languages(ships_on_date)
 
     return DailyDemand(
         date=d,
@@ -102,7 +98,6 @@ def generate_monthly_demand(
     year: int,
     month: int,
     ships: list[CruiseShipRead],
-    ship_language_map: dict[str, str] | None = None,
 ) -> list[DailyDemand]:
     """Generate demand profile for every day of the month.
 
@@ -110,9 +105,6 @@ def generate_monthly_demand(
     (May 1 – Oct 15). Days outside the season are silently skipped.
     Ships are filtered to those matching each day's date.
     """
-    if ship_language_map is None:
-        ship_language_map = {}
-
     _, days_in_month = calendar.monthrange(year, month)
     demands: list[DailyDemand] = []
 
@@ -124,7 +116,7 @@ def generate_monthly_demand(
             continue  # outside operating season
 
         ships_today = [s for s in ships if s.date == d]
-        demand = calculate_daily_demand(d, ships_today, season, ship_language_map)
+        demand = calculate_daily_demand(d, ships_today, season)
         demands.append(demand)
 
     return demands

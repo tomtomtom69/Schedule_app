@@ -242,22 +242,22 @@ class TestGenerateMonthlyDemand:
 
 
 class TestGetRequiredLanguages:
-    def test_extra_language_takes_priority(self):
+    def test_extra_language_used(self):
         d = date(2026, 7, 1)
-        ships = [_ship(extra_language="Spanish", d=d)]
-        langs = get_required_languages(ships, {"Test Ship": "german"})
+        ships = [_ship(extra_language="spanish", d=d)]
+        langs = get_required_languages(ships)
         assert langs == ["spanish"]
 
-    def test_falls_back_to_language_map(self):
+    def test_comma_separated_extra_language(self):
         d = date(2026, 7, 1)
-        ships = [_ship("Costa Luminosa", d=d)]
-        langs = get_required_languages(ships, {"Costa Luminosa": "Italian"})
-        assert langs == ["italian"]
+        ships = [_ship(extra_language="italian,spanish", d=d)]
+        langs = get_required_languages(ships)
+        assert langs == ["italian", "spanish"]
 
     def test_english_filtered_out(self):
         d = date(2026, 7, 1)
         ships = [_ship(extra_language="English", d=d)]
-        langs = get_required_languages(ships, {})
+        langs = get_required_languages(ships)
         assert langs == []
 
     def test_deduplication(self):
@@ -266,7 +266,7 @@ class TestGetRequiredLanguages:
             _ship("Ship A", d, extra_language="German"),
             _ship("Ship B", d, extra_language="german"),
         ]
-        langs = get_required_languages(ships, {})
+        langs = get_required_languages(ships)
         assert langs == ["german"]
 
     def test_multiple_languages_sorted(self):
@@ -275,16 +275,16 @@ class TestGetRequiredLanguages:
             _ship("Ship A", d, extra_language="Spanish"),
             _ship("Ship B", d, extra_language="German"),
         ]
-        langs = get_required_languages(ships, {})
+        langs = get_required_languages(ships)
         assert langs == ["german", "spanish"]
 
     def test_no_ships_returns_empty(self):
-        assert get_required_languages([], {}) == []
+        assert get_required_languages([]) == []
 
-    def test_ship_not_in_map_and_no_extra_language(self):
+    def test_no_extra_language_returns_empty(self):
         d = date(2026, 7, 1)
         ships = [_ship("Unknown Ship", d)]
-        langs = get_required_languages(ships, {})
+        langs = get_required_languages(ships)
         assert langs == []
 
 
