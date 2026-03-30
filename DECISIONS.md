@@ -193,44 +193,7 @@ falls back to first 7 days of the month).
 
 ---
 
-## Patterns to follow
-
-### Enum values
-Always use `.value` for display and DB writes. Use the `hasattr(x, 'value')` guard if
-the value might already be a plain string (e.g. after reading from DB before ORM conversion).
-
-### DB session
-Always use the context manager:
-```python
-with db_session() as db:
-    ...
-```
-`db_session()` is in `src/db/database.py`. It commits on exit and rolls back on exception.
-
-### Pydantic models vs ORM models
-- `EmployeeRead`, `CruiseShipRead`, `ScheduleRead` etc. are Pydantic (used everywhere in Python code)
-- `EmployeeORM`, `CruiseShipORM`, `ScheduleORM` etc. are SQLAlchemy (only used in DB sessions)
-- Convert ORM → Pydantic explicitly in data loaders (no `from_orm` — manual mapping)
-
-### LLM calls
-All LLM calls go through `src/llm_client.py:chat_completion()`. Never import `openai`
-anywhere else.
-
-### Streamlit session state
-- Initialise with `if key not in st.session_state: st.session_state[key] = default` at
-  the TOP of the page, before any widgets.
-- Never assign to a key after its widget has rendered.
-- For cross-page navigation values, use `_pending_*` keys + `st.rerun()`.
-
-### Adding a new page
-Streamlit multipage: add a file to `src/ui/pages/` with prefix `N_name.py`. The file
-must call `st.set_page_config()` as its first Streamlit call.
-
----
-
----
-
-## UI/UX fixes (session 2026-03-22)
+## UI/UX fixes
 
 ### 14. Ghost "NOT SAVED" warning after saving — upload pages
 **Bug:** After a successful DB save + `st.rerun()`, Streamlit keeps the uploaded file in
@@ -337,7 +300,6 @@ expanded mode; users couldn't find how to return to the schedule grid.
 ---
 
 ### 20. Opening hours coverage — hard constraint in solver
-
 **Bug:** The solver assigned almost all café staff to shift 5 (13:00–21:00). The café
 had zero staff from opening (08:30) until 13:00.
 
@@ -363,13 +325,17 @@ Key forced assignments for peak season (08:30–20:15):
 shifts. Extreme slots (only P1 or only P5) are skipped to avoid infeasibility with the
 limited production headcount.
 
+**NEVER remove or weaken this constraint.** It is the sole guarantee that the café is
+never empty during operating hours. The `if not cov_vars: continue` guard only fires when
+literally no employee has a variable for that slot (outside availability window) — it is
+not a loophole.
+
 **Where:** `src/solver/constraints.py` — `add_opening_hours_coverage()`.
 `src/solver/scheduler.py` — `_load_settings()`, `_add_hard_constraints()`.
 
 ---
 
 ### 21. Shift variety — soft constraint in solver
-
 **Problem:** Even with the coverage constraint fixing the morning/evening, the solver
 still tended to assign each employee to the same shift every day (e.g. always shift 1
 or always shift 5), producing an unnatural rigid schedule.
@@ -392,7 +358,6 @@ model.AddBoolOr([v1.Not(), v2.Not()]).OnlyEnforceIf(both_same.Not())
 ---
 
 ### 22. LLM Apply — grid refresh flash banner
-
 **Bug:** After clicking Apply on an LLM-proposed schedule change, the schedule grid
 visually re-rendered (because `_do_apply()` calls `st.rerun()`) but there was no
 confirmation visible next to the grid. Users couldn't tell whether their click worked.
@@ -409,13 +374,208 @@ on the next user interaction.
 
 ---
 
+### 23. Three new hard constraints — cross-month consecutive day violations
+**Problem:** Employees were appearing to work 7–11 consecutive days when their July
+schedule ended with several working days and their August schedule began with several more.
+The solver had no knowledge of the previous month's assignments.
+
+**Fix part 1 — cross-month constraint:**
+`add_cross_month_consecutive_constraint()` in `constraints.py`. Called during
+`build_model()` after `_load_prev_month_working()` queries the DB for M-1's schedule.
+
+Algorithm: for each employee, count consecutive working days ending on the last day of
+M-1 (`carry_in`, 0–6). If carry_in > 0, add a single binding constraint:
+`sum(shift_vars on days 1…{7−carry_in} of M) ≤ 6−carry_in`
+
+Only ONE constraint per employee is needed — all weaker windows are implied by it.
+Returns the count of constraints added (logged for debugging).
+
+**Fix part 2 — three new within-month hard constraints:**
+1. `add_max_days_per_calendar_week()` — ≤6 per Mon–Sun ISO week. Mathematically implied
+   by weekly rest but enforced explicitly as a named safety constraint.
+2. `add_max_consecutive_working_days()` — rolling gap-aware 7-day windows; only
+   constrains windows of exactly 7 consecutive calendar days (no date gaps).
+3. `add_two_consecutive_days_off_per_14()` — every rolling 14-day window must contain
+   ≥1 pair of adjacent off-days. Uses `pair_off_bv[(emp_id, d0)]` BoolVars (1 iff both
+   d0 and d0+1 are off). Handles 4 cases: both outside availability, one inside, both inside.
+
+**Performance note:** `add_two_consecutive_days_off_per_14` adds significant complexity.
+For August (31 days), the solver hits the 60s timeout and returns FEASIBLE (not OPTIMAL).
+This is acceptable — the solution respects all constraints.
+
+**Validator updated:** `src/solver/validator.py` has corresponding check functions:
+`_check_max_days_per_calendar_week`, `_check_max_consecutive_working_days` (cross-month
+aware via `_load_prev_month_working_dates`), `_check_two_consecutive_days_off_per_14`.
+
+**Where:** `src/solver/constraints.py`, `src/solver/scheduler.py`, `src/solver/validator.py`.
+
+---
+
+### 24. Over-coverage tiered penalty
+**Problem:** The solver was assigning 1 extra person on 6 scattered days to fill full-time
+contracted hours, but all the extras were on the same day — concentrating over-coverage
+rather than spreading it.
+
+**Fix:** `penalize_over_coverage()` in `soft_constraints.py`. Two BoolVar tiers per
+(day, role) where `min_needed > 0`:
+- `ov1`: 1 if assigned ≥ min_needed + 1 → penalty −3
+- `ov2`: 1 if assigned ≥ min_needed + 2 → additional penalty −5
+
+Effect: spreading 2 extras across 2 days costs −6; concentrating both on 1 day costs −8.
+The solver prefers spreading.
+
+**Where:** `src/solver/soft_constraints.py` — `penalize_over_coverage()`,
+`WEIGHTS["over_coverage_t1"] = 3`, `WEIGHTS["over_coverage_t2"] = 5`.
+
+---
+
+### 25. Staffing minimum capped to available headcount
+**Problem:** `add_daily_staffing_requirements` added hard constraint
+`sum(cafe_vars) >= demand.cafe_needed`. If `cafe_needed = 4` but only 3 café employees
+are available that day, the model is provably INFEASIBLE.
+
+**Fix:** Cap the hard minimum to the actual number of distinct café employees with
+variables for that day:
+```python
+cafe_emps_today = len({emp.id for emp in employees for s in cafe_shifts
+                        if (emp.id, d, s.id) in variables})
+effective_cafe_min = min(demand.cafe_needed, cafe_emps_today)
+model.Add(sum(cafe_vars) >= effective_cafe_min)
+```
+Same logic for production.
+
+**Why this still causes INFEASIBLE for low headcount:** If `effective_cafe_min = 3`
+(= all available café employees) every day for a 31-day month, the solver must work all
+3 every single day — but weekly rest requires ≥1 day off per 7 days. This is still
+INFEASIBLE. The fallback solver (Step C onwards) further reduces the minimum, giving
+employees enough slack for rest days.
+
+**Where:** `src/solver/constraints.py` — `add_daily_staffing_requirements()`.
+
+---
+
+### 26. Two-pass fallback solver
+**Decision:** When INFEASIBLE, instead of a dead end, offer a best-effort schedule with
+progressively relaxed constraints.
+
+**Why a button rather than automatic fallback:** The user must be aware that constraints
+were relaxed before using or publishing the schedule. An automatic silent fallback would
+hide the staffing shortage problem.
+
+**Implementation:** `src/solver/fallback.py` — `run_fallback_solve()` tries steps B→C→D→E.
+Each step creates a new `ScheduleGenerator` with a modified `demand` list (produced by
+`_relax_demand()`). Steps B and C reduce `cafe_needed`/`production_needed` in the demand
+dataclasses using `dataclasses.replace()`. Step D additionally passes
+`disable_both_preference=True` to `build_model()`, which threads through to
+`add_soft_constraints()` and skips `prefer_both_on_production()`.
+
+**`disable_both_preference` threading:**
+- `ScheduleGenerator.build_model(disable_both_preference=False)` → stores as `self._disable_both_preference`
+- `_add_soft_constraints()` → passes via `getattr(self, "_disable_both_preference", False)`
+- `add_soft_constraints(..., disable_both_preference=False)` → conditionally calls `prefer_both_on_production`
+
+**Session state for fallback:**
+- `_inf_info`, `_inf_demand`, `_inf_year`, `_inf_month` — stored when first pass is INFEASIBLE
+- `_fallback_result` — stored after successful fallback (holds StaffingGap list for the session)
+- Cleared on: new Generate click, Load Saved click
+
+**Persistence:** `ScheduleRead.is_fallback` + `fallback_notes` (JSON) stored in DB.
+`staffing_gaps_from_json()` and `relaxation_notes_from_json()` reconstruct on load, so
+the banner works even after a session restart.
+
+**Where:** `src/solver/fallback.py`, `src/solver/soft_constraints.py`,
+`src/solver/scheduler.py`, `src/ui/pages/4_schedule.py`, `src/ui/pages/5_schedule_editor.py`,
+`src/export/excel_export.py`.
+
+---
+
+### 27. Cross-month edit warnings
+**Problem:** If the user regenerates May and then looks at June (which was generated using
+the old May as its cross-month carry-in), June's consecutive-day constraints may now be
+wrong without any visual indication.
+
+**Fix — two warnings:**
+1. **After saving/approving M** (inline or persisted via `_cross_month_warn_sched`):
+   if M+1 exists in DB, warn to regenerate M+1.
+2. **Always-on banner on M's page:** if M-1's `modified_at > M's created_at`, warn that
+   M was generated before the latest version of M-1.
+
+**Helper functions** (in both `4_schedule.py` and `5_schedule_editor.py`):
+- `_next_month_name_if_exists(year, month)` — queries DB for M+1
+- `_stale_prev_month_warning(schedule)` — compares timestamps; returns warning string or None
+
+**Precision:** Uses `prev_orm.modified_at > schedule.created_at` (not `modified_at`) to
+avoid false positives from loading/viewing without editing.
+
+**Where:** `src/ui/pages/4_schedule.py` and `src/ui/pages/5_schedule_editor.py`.
+
+---
+
+### 28. Dark mode — chat panel HTML divs
+**Bug:** The LLM chat panel renders message bubbles and action cards as raw HTML divs.
+In dark mode, these divs had light background colors but no explicit text color set,
+so the text was dark-on-dark and invisible.
+
+**Fix:** Added explicit `color:` declarations to all inline HTML divs:
+- Message bubbles: `color:#1a1a1a`
+- Proposed changes banner: `color:#7B6000`
+- Applied card: `color:#155724`
+- Failed card: `color:#721c24`
+- Pending card: `color:#1a1a1a`
+- Empty state: `color:#888`
+
+**Where:** `src/ui/components/chat_panel.py` — all `st.markdown(f"<div style=...>")` calls.
+
+---
+
+## Patterns to follow
+
+### Enum values
+Always use `.value` for display and DB writes. Use the `hasattr(x, 'value')` guard if
+the value might already be a plain string (e.g. after reading from DB before ORM conversion).
+
+### DB session
+Always use the context manager:
+```python
+with db_session() as db:
+    ...
+```
+`db_session()` is in `src/db/database.py`. It commits on exit and rolls back on exception.
+
+### Pydantic models vs ORM models
+- `EmployeeRead`, `CruiseShipRead`, `ScheduleRead` etc. are Pydantic (used everywhere in Python code)
+- `EmployeeORM`, `CruiseShipORM`, `ScheduleORM` etc. are SQLAlchemy (only used in DB sessions)
+- Convert ORM → Pydantic explicitly in data loaders (no `from_orm` — manual mapping)
+- When reading new optional columns from ORM, use `getattr(orm, "col_name", default)` for backwards compatibility
+
+### LLM calls
+All LLM calls go through `src/llm_client.py:chat_completion()`. Never import `openai`
+anywhere else.
+
+### Streamlit session state
+- Initialise with `if key not in st.session_state: st.session_state[key] = default` at
+  the TOP of the page, before any widgets.
+- Never assign to a key after its widget has rendered.
+- For cross-page navigation values, use `_pending_*` keys + `st.rerun()`.
+
+### Adding a new page
+Streamlit multipage: add a file to `src/ui/pages/` with prefix `N_name.py`. The file
+must call `st.set_page_config()` as its first Streamlit call.
+
+### Adding a new DB column
+1. Add to ORM model in `src/models/`
+2. Add to Pydantic Read schema (with default for backwards compat)
+3. Add `ALTER TABLE ... ADD COLUMN IF NOT EXISTS ...` to `run_safe_migrations()` in `src/db/migrations.py`
+4. Read with `getattr(orm, "col_name", default)` until you know the migration has run
+5. Run `docker exec geiranger-scheduler-app python -c "from src.db.migrations import run_safe_migrations; run_safe_migrations()"` to apply immediately
+
+---
+
 ## Known limitations / future work
 
-- The solver timeout is 60 seconds. For large months (many employees, many constraint
-  combinations), it may return FEASIBLE (not OPTIMAL). This is acceptable.
-- The Excel export uses a fixed two-block layout (days 1–15, 16–31). It does not adapt
-  to months shorter than 31 days in a cosmetically perfect way.
-- The LLM advisor has no memory of which changes were applied in previous sessions — it
-  only has the current conversation history (capped at 20 turns).
-- `6_export.py` (renamed from `5_export.py` after editor was added as page 5) — if the
-  Export page is referenced as page 5 anywhere, check the actual filename.
+- The solver timeout is 60 seconds per pass. For complex months (`add_two_consecutive_days_off_per_14` especially), it may return FEASIBLE (not OPTIMAL). This is acceptable.
+- The fallback solver runs up to 4 passes × 60s each — worst case ~4 minutes. The spinner stays visible throughout.
+- The Excel export uses a fixed two-block layout (days 1–15, 16–31). It does not adapt to months shorter than 31 days in a cosmetically perfect way.
+- The LLM advisor has no memory of which changes were applied in previous sessions — it only has the current conversation history (capped at 20 turns).
+- Cross-month validator checks for `_check_two_consecutive_days_off_per_14` use a sliding-by-14 window to avoid flooding violations; the first occurrence in each window is reported.
+- Sunday rest: the rolling 26-week average (≤13 Sundays per 26) cannot be enforced within a single month. It is monitored by the validator as a warning only.

@@ -242,7 +242,10 @@ def apply_action(
             return schedule, warnings
         valid_shifts = {s.id for s in shift_templates}
         if shift_id not in valid_shifts:
-            warnings.append(f"Shift '{shift_id}' not found. Valid IDs: {sorted(valid_shifts)}")
+            warnings.append(
+                f"Invalid shift '{shift_id}' suggested — only predefined shifts are allowed. "
+                f"Valid shift IDs: {', '.join(sorted(valid_shifts))}"
+            )
             return schedule, warnings
 
     # Determine new shift_id and is_day_off

@@ -292,6 +292,16 @@ def parse_employees_csv(file) -> ParseResult:
     for idx, row in df.iterrows():
         row_num = idx + 2  # 1-indexed with header
         try:
+            # Optional date_of_birth column
+            dob_raw = row.get("date_of_birth") if "date_of_birth" in df.columns else None
+            if dob_raw is not None and not (isinstance(dob_raw, float) and pd.isna(dob_raw)):
+                try:
+                    dob = pd.to_datetime(str(dob_raw)).date()
+                except Exception:
+                    dob = None
+            else:
+                dob = None
+
             data = {
                 "name":               str(row.get("name", "")).strip(),
                 "languages":          _coerce_languages(row.get("languages", "")),
@@ -303,6 +313,7 @@ def parse_employees_csv(file) -> ParseResult:
                 "availability_start": pd.to_datetime(row.get("availability_start")).date(),
                 "availability_end":   pd.to_datetime(row.get("availability_end")).date(),
                 "preferences":        None,
+                "date_of_birth":      dob,
             }
             records.append(EmployeeCreate(**data))
         except (ValidationError, Exception) as e:

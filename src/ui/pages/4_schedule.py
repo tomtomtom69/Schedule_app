@@ -15,14 +15,69 @@ from src.models.employee import EmployeeORM, EmployeeRead
 from src.models.enums import ScheduleStatus
 from src.models.schedule import AssignmentORM, AssignmentRead, ScheduleORM, ScheduleRead
 from src.models.shift_template import ShiftTemplateORM, ShiftTemplateRead
-from src.solver import ScheduleGenerator, Violation, validate_schedule
+from src.solver import ScheduleGenerator, Violation, validate_schedule, run_fallback_solve
+from src.solver.fallback import relaxation_notes_from_json, staffing_gaps_from_json
 from src.ui.components.chat_panel import render_chat_panel
 from src.ui.components.schedule_grid import render_schedule_grid
+from src.ui.components.sidebar import render_shift_legend
 
 st.set_page_config(page_title="Schedule", page_icon="📅", layout="wide")
+render_shift_legend()
 st.title("📅 Schedule Generator")
 
 SEASON_MONTHS = {5: "May", 6: "June", 7: "July", 8: "August", 9: "September", 10: "October"}
+
+
+# ── Cross-month consistency helpers ──────────────────────────────────────────
+
+def _next_month_name_if_exists(year: int, month: int) -> str | None:
+    """Return 'June 2026' if a saved schedule for month+1 exists in DB, else None."""
+    try:
+        next_m = month % 12 + 1
+        next_y = year + (1 if month == 12 else 0)
+        if next_m not in SEASON_MONTHS:
+            return None
+        with db_session() as db:
+            exists = db.query(ScheduleORM).filter_by(year=next_y, month=next_m).first()
+            return f"{SEASON_MONTHS[next_m]} {next_y}" if exists else None
+    except Exception:
+        return None
+
+
+def _stale_prev_month_warning(schedule: "ScheduleRead") -> str | None:
+    """Return a warning string if the previous month was saved *after* this schedule
+    was created (meaning this schedule may not reflect the latest prev-month data).
+    Returns None if everything is in sync or no previous schedule exists.
+    """
+    try:
+        prev_m = schedule.month - 1
+        prev_y = schedule.year
+        if prev_m == 0:
+            prev_m = 12
+            prev_y -= 1
+        if prev_m not in SEASON_MONTHS:
+            return None
+        with db_session() as db:
+            prev_orm = (
+                db.query(ScheduleORM)
+                .filter_by(year=prev_y, month=prev_m)
+                .order_by(ScheduleORM.modified_at.desc())
+                .first()
+            )
+            if prev_orm is None or prev_orm.modified_at is None:
+                return None
+            if prev_orm.modified_at > schedule.created_at:
+                curr_name = f"{SEASON_MONTHS[schedule.month]} {schedule.year}"
+                prev_name = f"{SEASON_MONTHS[prev_m]} {prev_y}"
+                return (
+                    f"The **{prev_name}** schedule was modified after this **{curr_name}** "
+                    f"schedule was generated. Consider regenerating **{curr_name}** to ensure "
+                    "the consecutive-day constraints and cross-month carry-in are up to date."
+                )
+        return None
+    except Exception:
+        return None
+
 
 # ── Helper: load data from DB ─────────────────────────────────────────────────
 
@@ -104,6 +159,8 @@ def load_saved_schedule(year: int, month: int) -> ScheduleRead | None:
                 created_at=orm.created_at,
                 modified_at=orm.modified_at,
                 assignments=assignments,
+                is_fallback=getattr(orm, "is_fallback", False),
+                fallback_notes=getattr(orm, "fallback_notes", None),
             )
     except Exception:
         return None
@@ -128,6 +185,8 @@ def save_schedule_to_db(schedule: ScheduleRead) -> bool:
                 status=schedule.status.value,
                 created_at=schedule.created_at,
                 modified_at=datetime.utcnow(),
+                is_fallback=getattr(schedule, "is_fallback", False),
+                fallback_notes=getattr(schedule, "fallback_notes", None),
             )
             db.add(orm)
             db.flush()
@@ -263,7 +322,29 @@ with main_col:
         st.write("")
         load_clicked = st.button("📂 Load Saved", use_container_width=True)
 
-    # ── Generate ──────────────────────────────────────────────────────────────
+    # ── Helper: render SolveInfo diagnostics ─────────────────────────────────
+    def _render_solver_diagnostics(info) -> None:
+        cols = st.columns(4)
+        cols[0].metric("Status", info.status_name)
+        cols[1].metric("Variables", f"{info.num_variables:,}")
+        cols[2].metric("Available employees", info.num_employees_available)
+        cols[3].metric("Working shifts", info.num_working_assignments)
+        if info.wall_time > 0:
+            st.caption(
+                f"Solver wall time: {info.wall_time:.2f}s  |  "
+                f"Days in month: {info.num_days}  |  "
+                f"Objective: {info.objective_value:.0f}"
+            )
+        if info.warnings:
+            st.markdown("**⚠️ Warnings:**")
+            for w in info.warnings:
+                st.warning(w)
+        if info.diagnostics:
+            st.markdown("**❌ Issues:**")
+            for d_msg in info.diagnostics:
+                st.error(d_msg)
+
+    # ── Generate first pass ───────────────────────────────────────────────────
     if generate_clicked:
         if not _avail_emps:
             st.error("Cannot generate: no employees are available for this month. Fix availability dates first.")
@@ -271,6 +352,9 @@ with main_col:
             st.warning("Generating without ship data — demand will be minimal (base staffing only).")
 
     if generate_clicked and _avail_emps:
+        # Clear any prior infeasible/fallback state for a fresh attempt
+        for _k in ("_inf_info", "_inf_demand", "_inf_year", "_inf_month", "_fallback_result"):
+            st.session_state.pop(_k, None)
         with st.spinner(f"Generating {SEASON_MONTHS[sel_month]} {sel_year} schedule (up to 60s)…"):
             try:
                 demand = generate_monthly_demand(sel_year, sel_month, ships)
@@ -282,37 +366,21 @@ with main_col:
                     result = gen.solve()
                     info = gen.solve_info
 
-                    # ── Always show solver diagnostics panel ───────────────
-                    with st.expander("🔍 Solver diagnostics", expanded=(result is None)):
-                        cols = st.columns(4)
-                        cols[0].metric("Status", info.status_name)
-                        cols[1].metric("Variables", f"{info.num_variables:,}")
-                        cols[2].metric("Available employees", info.num_employees_available)
-                        cols[3].metric("Working shifts", info.num_working_assignments)
-                        if info.wall_time > 0:
-                            st.caption(f"Solver wall time: {info.wall_time:.2f}s  |  "
-                                       f"Days in month: {info.num_days}  |  "
-                                       f"Objective: {info.objective_value:.0f}")
-                        if info.warnings:
-                            st.markdown("**⚠️ Warnings:**")
-                            for w in info.warnings:
-                                st.warning(w)
-                        if info.diagnostics:
-                            st.markdown("**❌ Issues:**")
-                            for d_msg in info.diagnostics:
-                                st.error(d_msg)
-
                     if result is None:
-                        st.error(
-                            f"**Schedule generation failed** (solver status: `{info.status_name}`).  \n"
-                            "See the diagnostics panel above for details."
-                        )
+                        # Store for the persistent fallback section below
+                        st.session_state["_inf_info"] = info
+                        st.session_state["_inf_demand"] = demand
+                        st.session_state["_inf_year"] = sel_year
+                        st.session_state["_inf_month"] = sel_month
+                        # Don't render error here — handled by the infeasible section below
                     else:
                         st.session_state["current_schedule"] = result
                         st.session_state["current_demand"] = demand
                         st.session_state["schedule_year"] = sel_year
                         st.session_state["schedule_month"] = sel_month
                         n_working = sum(1 for a in result.assignments if not a.is_day_off)
+                        with st.expander("🔍 Solver diagnostics"):
+                            _render_solver_diagnostics(info)
                         st.success(
                             f"✅ Schedule generated!  \n"
                             f"**{n_working}** working assignments across **{len(demand)}** days  \n"
@@ -323,6 +391,77 @@ with main_col:
                 import traceback
                 st.code(traceback.format_exc(), language="text")
 
+    # ── Infeasible state: diagnostics + fallback button ───────────────────────
+    _inf_info = st.session_state.get("_inf_info")
+    _inf_year = st.session_state.get("_inf_year")
+    _inf_month = st.session_state.get("_inf_month")
+
+    if _inf_info and _inf_year == sel_year and _inf_month == sel_month:
+        st.error(
+            f"**Schedule generation failed** (solver status: `{_inf_info.status_name}`).  \n"
+            "The current constraints cannot be satisfied with the available employees."
+        )
+        with st.expander("🔍 Solver diagnostics", expanded=True):
+            _render_solver_diagnostics(_inf_info)
+
+        st.divider()
+        st.warning(
+            "**No valid schedule found with all constraints active.**  \n"
+            "You can generate a best-effort schedule where non-critical constraints "
+            "are progressively relaxed until a solution is found."
+        )
+        st.caption(
+            "**Never relaxed:** opening hours coverage (≥1 in café at all times) · "
+            "max 6 consecutive working days · daily/weekly rest periods · "
+            "age-based limits · Eidsdal driver requirement · staffing caps"
+        )
+        if st.button(
+            "⚡ Generate Best-Effort Schedule — some constraints will be relaxed to find a workable solution",
+            type="primary",
+            use_container_width=True,
+            key="fallback_btn",
+        ):
+            _demand_fb = st.session_state.get("_inf_demand", [])
+            if _demand_fb:
+                with st.spinner(
+                    "Running fallback solver — trying progressive constraint relaxation "
+                    "(up to 4 passes × 60s each)…"
+                ):
+                    try:
+                        fb_result = run_fallback_solve(employees, _demand_fb, shifts)
+                    except Exception as _fe:
+                        st.error(f"Fallback solver error: {_fe}")
+                        import traceback
+                        st.code(traceback.format_exc(), language="text")
+                        fb_result = None
+
+                if fb_result is not None:
+                    fb_schedule = ScheduleRead(
+                        id=fb_result.schedule.id,
+                        month=fb_result.schedule.month,
+                        year=fb_result.schedule.year,
+                        status=ScheduleStatus.draft,
+                        created_at=fb_result.schedule.created_at,
+                        assignments=fb_result.schedule.assignments,
+                        is_fallback=True,
+                        fallback_notes=fb_result.notes_json(),
+                    )
+                    st.session_state["current_schedule"] = fb_schedule
+                    st.session_state["current_demand"] = _demand_fb
+                    st.session_state["schedule_year"] = sel_year
+                    st.session_state["schedule_month"] = sel_month
+                    st.session_state["_fallback_result"] = fb_result
+                    for _k in ("_inf_info", "_inf_demand", "_inf_year", "_inf_month"):
+                        st.session_state.pop(_k, None)
+                    st.rerun()
+                else:
+                    st.error(
+                        "⛔ **Fallback solver exhausted all relaxation steps** — no workable "
+                        "schedule found. This usually means there are not enough employees to "
+                        "cover opening hours (≥1 in café at all times) while respecting rest "
+                        "constraints. Add more employees or adjust their availability dates."
+                    )
+
     # ── Load saved ────────────────────────────────────────────────────────────
     if load_clicked:
         saved = load_saved_schedule(sel_year, sel_month)
@@ -332,6 +471,8 @@ with main_col:
             st.session_state["current_demand"] = demand
             st.session_state["schedule_year"] = sel_year
             st.session_state["schedule_month"] = sel_month
+            for _k in ("_inf_info", "_inf_demand", "_inf_year", "_inf_month", "_fallback_result"):
+                st.session_state.pop(_k, None)
             st.success(f"Loaded saved schedule (status: {saved.status.value}).")
         else:
             st.warning(f"No saved schedule found for {SEASON_MONTHS[sel_month]} {sel_year}.")
@@ -354,6 +495,41 @@ with main_col:
             if "_apply_flash" in st.session_state:
                 st.success(f"✅ {st.session_state.pop('_apply_flash')} — schedule grid updated below")
 
+            # Cross-month warning: persisted across rerun (from Approve path)
+            if "_cross_month_warn_sched" in st.session_state:
+                st.warning(st.session_state.pop("_cross_month_warn_sched"))
+
+            # Cross-month stale warning: shown whenever prev month was edited after
+            # this schedule was generated (always-on check)
+            _stale = _stale_prev_month_warning(schedule)
+            if _stale:
+                st.warning(f"⚠️ {_stale}")
+
+            # Fallback banner: shown when schedule was generated in fallback mode
+            if getattr(schedule, "is_fallback", False):
+                _fb_notes = relaxation_notes_from_json(schedule.fallback_notes or "")
+                with st.container(border=True):
+                    st.warning(
+                        "⚠️ **Best-effort schedule** — this schedule was generated with "
+                        "relaxed constraints because the normal solver could not find a "
+                        "valid solution with the current number of available employees."
+                    )
+                    if _fb_notes:
+                        st.markdown("**Constraints that were relaxed:**")
+                        for _note in _fb_notes:
+                            st.markdown(f"- {_note}")
+                # Staffing gaps — try live result first, fall back to stored JSON
+                _fb_result = st.session_state.get("_fallback_result")
+                _gaps = _fb_result.staffing_gaps if _fb_result else staffing_gaps_from_json(schedule.fallback_notes or "")
+                if _gaps:
+                    with st.expander(
+                        f"📋 Staffing Gaps — {len(_gaps)} day(s) below normal requirements "
+                        "(focus hiring or manual adjustments here)",
+                        expanded=True,
+                    ):
+                        for _gap in _gaps:
+                            st.write(f"🔴 {_gap.description()}")
+
             # ── Action buttons ────────────────────────────────────────────────
             _is_approved = schedule.status == ScheduleStatus.approved
             st.info(
@@ -369,6 +545,14 @@ with main_col:
                 if st.button("💾 Save Draft", use_container_width=True, disabled=_is_approved):
                     if save_schedule_to_db(schedule):
                         st.success("Saved as draft — you can keep editing.")
+                        _next = _next_month_name_if_exists(schedule.year, schedule.month)
+                        if _next:
+                            curr_name = f"{SEASON_MONTHS[schedule.month]} {schedule.year}"
+                            st.warning(
+                                f"⚠️ You have modified the **{curr_name}** schedule. "
+                                f"The **{_next}** schedule was generated based on the previous "
+                                f"version — consider regenerating **{_next}** to ensure consistency."
+                            )
 
             with act2:
                 if not _is_approved:
@@ -384,6 +568,15 @@ with main_col:
                                 )
                                 st.session_state["current_schedule"] = updated
                                 st.success("✅ Schedule approved and finalized!")
+                                _next = _next_month_name_if_exists(schedule.year, schedule.month)
+                                if _next:
+                                    curr_name = f"{SEASON_MONTHS[schedule.month]} {schedule.year}"
+                                    st.session_state["_cross_month_warn_sched"] = (
+                                        f"⚠️ You have modified the **{curr_name}** schedule. "
+                                        f"The **{_next}** schedule was generated based on the "
+                                        f"previous version — consider regenerating **{_next}** "
+                                        "to ensure consistency."
+                                    )
                                 st.rerun()
                 else:
                     st.success("✅ Approved & finalized")

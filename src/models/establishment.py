@@ -17,6 +17,8 @@ class EstablishmentSettingsBase(BaseModel):
     opening_time: time
     closing_time: time
     production_start: time
+    max_cafe_per_day: int = 5   # hard cap on café staff; 6 allowed when ≥2 good ships
+    max_prod_per_day: int = 4   # hard cap on production staff
 
     @model_validator(mode="after")
     def validate_times_and_dates(self) -> "EstablishmentSettingsBase":
@@ -50,3 +52,5 @@ class EstablishmentSettingsORM(Base):
     opening_time = Column(Time, nullable=False)
     closing_time = Column(Time, nullable=False)
     production_start = Column(Time, nullable=False)
+    max_cafe_per_day = Column(Integer, nullable=False, default=5)
+    max_prod_per_day = Column(Integer, nullable=False, default=4)

@@ -1,6 +1,6 @@
 import uuid
 from datetime import date
-from typing import Any
+from typing import Any, Optional
 
 from pydantic import BaseModel, field_validator, model_validator
 from sqlalchemy import Boolean, Column, Date, Float, JSON, String
@@ -8,6 +8,27 @@ from sqlalchemy.dialects.postgresql import UUID
 
 from src.db.database import Base
 from src.models.enums import EmploymentType, Housing, RoleCapability
+
+
+# ── Age helpers ──────────────────────────────────────────────────────────────
+
+
+def get_age_on_date(date_of_birth: date, target_date: date) -> int:
+    """Return the employee's age in whole years on *target_date*."""
+    age = target_date.year - date_of_birth.year
+    # Subtract 1 if birthday hasn't occurred yet in target year
+    if (target_date.month, target_date.day) < (date_of_birth.month, date_of_birth.day):
+        age -= 1
+    return age
+
+
+def get_age_category(age: int) -> str:
+    """Return age category string: 'under_15', 'age_15_18', or 'adult'."""
+    if age < 15:
+        return "under_15"
+    if age < 18:
+        return "age_15_18"
+    return "adult"
 
 SEASON_START_MONTH = 5   # May
 SEASON_START_DAY = 1
@@ -29,6 +50,7 @@ class EmployeeBase(BaseModel):
     availability_start: date
     availability_end: date
     preferences: dict[str, Any] | None = None
+    date_of_birth: Optional[date] = None
 
     @field_validator("languages")
     @classmethod
@@ -88,3 +110,4 @@ class EmployeeORM(Base):
     availability_start = Column(Date, nullable=False)
     availability_end = Column(Date, nullable=False)
     preferences = Column(JSON, nullable=True)
+    date_of_birth = Column(Date, nullable=True)

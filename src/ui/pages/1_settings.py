@@ -12,6 +12,8 @@ from src.models.establishment import EstablishmentSettingsORM
 from src.models.shift_template import ShiftTemplateORM
 
 st.set_page_config(page_title="Settings", page_icon="⚙️", layout="wide")
+from src.ui.components.sidebar import render_shift_legend
+render_shift_legend()
 st.title("⚙️ Settings")
 
 tab1, tab2, tab3, tab4 = st.tabs(
@@ -34,6 +36,8 @@ with tab1:
                     "Opening": str(s.opening_time)[:5],
                     "Closing": str(s.closing_time)[:5],
                     "Production Start": str(s.production_start)[:5],
+                    "Max Café/Day": getattr(s, "max_cafe_per_day", 5) or 5,
+                    "Max Prod/Day": getattr(s, "max_prod_per_day", 4) or 4,
                 }
                 for s in db.query(EstablishmentSettingsORM).order_by(
                     EstablishmentSettingsORM.date_range_start
@@ -57,6 +61,16 @@ with tab1:
                     "Opening": st.column_config.TextColumn("Opening (HH:MM)"),
                     "Closing": st.column_config.TextColumn("Closing (HH:MM)"),
                     "Production Start": st.column_config.TextColumn("Prod Start (HH:MM)"),
+                    "Max Café/Day": st.column_config.NumberColumn(
+                        "Max Café/Day",
+                        min_value=1, max_value=20,
+                        help="Hard cap on café staff per day (raised to cap+1 if ≥2 good ships in port).",
+                    ),
+                    "Max Prod/Day": st.column_config.NumberColumn(
+                        "Max Prod/Day",
+                        min_value=0, max_value=20,
+                        help="Hard cap on production staff per day.",
+                    ),
                 },
                 hide_index=True,
                 num_rows="fixed",
@@ -80,6 +94,8 @@ with tab1:
                             orm.closing_time = time(h, m)
                             h, m = map(int, row["Production Start"].split(":"))
                             orm.production_start = time(h, m)
+                            orm.max_cafe_per_day = int(row["Max Café/Day"])
+                            orm.max_prod_per_day = int(row["Max Prod/Day"])
                     st.success("Season configurations saved.")
                     st.rerun()
                 except Exception as e:

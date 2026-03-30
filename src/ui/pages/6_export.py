@@ -15,8 +15,10 @@ from src.models.enums import ScheduleStatus
 from src.models.schedule import AssignmentORM, AssignmentRead, ScheduleORM, ScheduleRead
 from src.models.shift_template import ShiftTemplateORM, ShiftTemplateRead
 from src.solver import validate_schedule
+from src.ui.components.sidebar import render_shift_legend
 
 st.set_page_config(page_title="Export", page_icon="📤", layout="wide")
+render_shift_legend()
 st.title("📤 Export & Validation")
 
 SEASON_MONTHS = {5: "May", 6: "June", 7: "July", 8: "August", 9: "September", 10: "October"}

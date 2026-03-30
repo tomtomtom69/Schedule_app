@@ -76,6 +76,12 @@ def calculate_daily_demand(
     production_needed = rules["production"]
     cafe_needed = rules["cafe"]
 
+    # Section 9: On quiet Sundays/Mondays with no cruise, allow reduced staffing.
+    # Sunday=6, Monday=0 in Python's weekday() system.
+    if not has_cruise and d.weekday() in (0, 6):
+        cafe_needed = min(cafe_needed, 1)
+        production_needed = 0
+
     languages_required = get_required_languages(ships_on_date)
 
     return DailyDemand(

@@ -18,12 +18,19 @@ from src.models.schedule import AssignmentRead, ScheduleRead
 from src.models.shift_template import ShiftTemplateRead
 from src.solver.constraints import (
     Variables,
+    add_age_based_constraints,
     add_availability,
+    add_cross_month_consecutive_constraint,
     add_daily_rest,
     add_daily_staffing_requirements,
+    add_max_consecutive_working_days,
+    add_max_days_per_calendar_week,
+    add_max_staffing_caps,
     add_one_shift_per_day,
     add_opening_hours_coverage,
     add_role_capability,
+    add_sunday_rest_constraints,
+    add_two_consecutive_days_off_per_14,
     add_weekly_hour_limits,
     add_weekly_rest,
 )
@@ -87,14 +94,31 @@ class ScheduleGenerator:
         # Derived state populated during build
         self._days: list[date] = sorted(d.date for d in demand)
         self._demand_map: dict[date, DailyDemand] = {d.date: d for d in demand}
+        # Previous month's working dates — loaded during build_model for cross-month constraints
+        self._prev_month_working: dict[str, set[date]] = {}
 
     # ── Public interface ─────────────────────────────────────────────────────
 
-    def build_model(self) -> None:
-        """Build the complete CP-SAT model: variables + hard + soft constraints."""
+    def build_model(self, disable_both_preference: bool = False) -> None:
+        """Build the complete CP-SAT model: variables + hard + soft constraints.
+
+        disable_both_preference: passed through to soft constraints; used in
+        fallback Step D to allow 'both' employees to cover café freely.
+        """
+        self._disable_both_preference = disable_both_preference
         # Load establishment settings if not provided — needed for coverage constraints
         if self.settings is None:
             self.settings = self._load_settings()
+
+        # Load previous month's working dates for cross-month consecutive-day constraint
+        if self._days:
+            y, m = self._days[0].year, self._days[0].month
+            self._prev_month_working = self._load_prev_month_working(y, m)
+            n_prev = sum(1 for v in self._prev_month_working.values() if v)
+            logger.info(
+                "Previous month schedule loaded: %d employee(s) with working dates in %d-%02d",
+                n_prev, y, m - 1 if m > 1 else 12,
+            )
 
         self._create_variables()
         self._pre_flight_checks()
@@ -265,17 +289,55 @@ class ScheduleGenerator:
             self.model, self.variables, self._demand_map,
             self.employees, self.shifts, self._days,
         )
+        # Section 2 + 8: use worked_hours coefficients; cap adults at 37.5h/week
         add_weekly_hour_limits(self.model, self.variables, self.employees, self.shifts, self._days)
         add_daily_rest(self.model, self.variables, self.employees, self.shifts, self._days)
+        # Rolling 7-day ≤ 6 (35h weekly rest)
         add_weekly_rest(self.model, self.variables, self.employees, self.shifts, self._days)
+        # Constraint 1: explicit Mon–Sun calendar-week cap
+        add_max_days_per_calendar_week(
+            self.model, self.variables, self.employees, self.shifts, self._days
+        )
+        # Constraint 2a: explicit consecutive-days cap within month (gap-aware rolling 7-day windows)
+        add_max_consecutive_working_days(
+            self.model, self.variables, self.employees, self.shifts, self._days
+        )
+        # Constraint 2b: cross-month consecutive-days constraint — prevents runs that start
+        # at the end of the previous month and continue into the first days of this month
+        n_cross = add_cross_month_consecutive_constraint(
+            self.model, self.variables, self.employees, self.shifts,
+            self._days, self._prev_month_working,
+        )
+        logger.info("Cross-month consecutive-day constraints added: %d", n_cross)
+        # Constraint 3: ≥2 consecutive days off in every rolling 14-day window
+        add_two_consecutive_days_off_per_14(
+            self.model, self.variables, self.employees, self.shifts, self._days
+        )
         # NOTE: language matching is now a SOFT constraint (see soft_constraints.py)
         add_role_capability(self.model, self.variables, self.employees, self.shifts)
         add_availability(self.model, self.variables, self.employees, self._days)
         add_eidsdal_transport_constraints(
             self.model, self.variables, self.employees, self.shifts, self._days
         )
+        # Section 3: age-based shift restrictions
+        add_age_based_constraints(
+            self.model, self.variables, self.employees, self.shifts, self._days
+        )
+        # Section 7: Sunday/holiday rest rules
+        add_sunday_rest_constraints(
+            self.model, self.variables, self.employees, self.shifts, self._days
+        )
         settings_list = self.settings if isinstance(self.settings, list) else (
             [self.settings] if self.settings else []
+        )
+        # Section 6: maximum staffing caps per day
+        max_cafe = min((s.max_cafe_per_day for s in settings_list), default=5)
+        max_prod = min((s.max_prod_per_day for s in settings_list), default=4)
+        add_max_staffing_caps(
+            self.model, self.variables, self._demand_map,
+            self.employees, self.shifts, self._days,
+            default_max_cafe=max_cafe,
+            default_max_prod=max_prod,
         )
         add_opening_hours_coverage(
             self.model, self.variables, self.employees, self.shifts,
@@ -286,7 +348,52 @@ class ScheduleGenerator:
         add_soft_constraints(
             self.model, self.variables, self.employees, self.shifts,
             self._days, self._demand_map,
+            disable_both_preference=getattr(self, "_disable_both_preference", False),
         )
+
+    @staticmethod
+    def _load_prev_month_working(year: int, month: int) -> dict[str, set[date]]:
+        """Load the previous month's working dates per employee from the DB.
+
+        Returns a dict of str(employee_id) → set[date] (working days only, no day-offs).
+        Returns {} silently if no previous schedule exists or the DB is unavailable.
+        """
+        try:
+            from src.db.database import db_session
+            from src.models.schedule import ScheduleORM
+
+            prev_month = month - 1
+            prev_year = year
+            if prev_month == 0:
+                prev_month = 12
+                prev_year -= 1
+
+            with db_session() as db:
+                orm = (
+                    db.query(ScheduleORM)
+                    .filter_by(year=prev_year, month=prev_month)
+                    .order_by(ScheduleORM.created_at.desc())
+                    .first()
+                )
+                if not orm:
+                    logger.info(
+                        "No saved schedule for %d-%02d — cross-month carry-in assumed 0 for all employees.",
+                        prev_year, prev_month,
+                    )
+                    return {}
+
+                result: dict[str, set[date]] = {}
+                for a in orm.assignments:
+                    if not a.is_day_off:
+                        result.setdefault(str(a.employee_id), set()).add(a.date)
+                logger.info(
+                    "Loaded previous month (%d-%02d): %d employee(s) with working assignments.",
+                    prev_year, prev_month, len(result),
+                )
+                return result
+        except Exception as exc:
+            logger.warning("Could not load previous month schedule: %s", exc)
+            return {}
 
     @staticmethod
     def _load_settings() -> list[EstablishmentSettingsRead]:
@@ -307,6 +414,8 @@ class ScheduleGenerator:
                         opening_time=r.opening_time,
                         closing_time=r.closing_time,
                         production_start=r.production_start,
+                        max_cafe_per_day=getattr(r, "max_cafe_per_day", 5) or 5,
+                        max_prod_per_day=getattr(r, "max_prod_per_day", 4) or 4,
                     )
                     for r in rows
                 ]

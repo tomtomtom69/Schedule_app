@@ -137,13 +137,26 @@ function doesn't use it directly. This ensures `Base.metadata` knows about the t
   - "Save Draft" disabled when approved
   - "Approve & Finalize" is the approval action (was "Approve")
   - "Export" disabled until approved, with tooltip
-- Solver diagnostics shown in expander after every generation attempt (`gen.solve_info`)
+- **Two-pass generation flow:**
+  1. First pass: normal solver. On success → show schedule. On INFEASIBLE → store
+     `_inf_info`, `_inf_demand`, `_inf_year`, `_inf_month` in session state; render
+     diagnostics + "⚡ Generate Best-Effort Schedule" button (key: `fallback_btn`)
+  2. Fallback button → calls `run_fallback_solve()` in `src/solver/fallback.py`; on
+     success creates `ScheduleRead(is_fallback=True, fallback_notes=JSON)` and stores
+     `_fallback_result` in session state
+  3. Clear all `_inf_*` / `_fallback_result` keys on new Generate click or Load Saved
+- Solver diagnostics helper `_render_solver_diagnostics(info)` defined inline on the page
 - Column ratio: `[2, 3] if chat_expanded else [3, 1]`
 - **When `chat_expanded` is True**, a full-width primary "Return to Schedule View" button
   is rendered above both columns (key: `return_schedule_banner`)
 - Flash banner: after `st.divider()` inside the `else:` branch, pop `_apply_flash` from
   session state and show `st.success()` — this gives immediate grid-update confirmation
   after an LLM Apply click
+- **Cross-month warnings:** `_next_month_name_if_exists` + `_stale_prev_month_warning`
+  helpers; warn after Save/Approve if M+1 exists; always-on stale banner if M-1 was
+  modified after M was generated
+- **Fallback banner:** shown when `schedule.is_fallback` — yellow bordered container with
+  relaxation notes list + staffing gaps expander
 
 ### `src/ui/pages/5_schedule_editor.py`
 - Session state initialised at module level (before columns/widgets):
@@ -153,6 +166,7 @@ function doesn't use it directly. This ensures `Base.metadata` knows about the t
 - Column ratio: `[2, 3] if chat_expanded else [3, 1]`
 - Same full-width return banner as `4_schedule.py` when expanded
 - Flash banner: same `_apply_flash` pop pattern after `st.divider()`, before `st.subheader`
+- Same cross-month warning helpers and fallback banner as `4_schedule.py`
 
 ### `src/ui/pages/6_export.py`
 - 4 tabs: Download (Excel+PDF), Validation, Employee Summary, Coverage Heatmap

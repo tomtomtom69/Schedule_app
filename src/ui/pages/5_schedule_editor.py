@@ -16,13 +16,67 @@ from src.models.enums import ScheduleStatus
 from src.models.schedule import AssignmentORM, AssignmentRead, ScheduleORM, ScheduleRead
 from src.models.shift_template import ShiftTemplateORM, ShiftTemplateRead
 from src.solver import validate_schedule
+from src.solver.fallback import relaxation_notes_from_json, staffing_gaps_from_json
 from src.ui.components.chat_panel import render_chat_panel
+from src.ui.components.sidebar import render_shift_legend
 
 st.set_page_config(page_title="Schedule Editor", page_icon="✏️", layout="wide")
+render_shift_legend()
 st.title("✏️ Schedule Editor")
 st.caption("Click any cell to change an assignment. Shift codes: 1–6 (café), P1–P5 (production), off = day off, leave blank = remove.")
 
 SEASON_MONTHS = {5: "May", 6: "June", 7: "July", 8: "August", 9: "September", 10: "October"}
+
+
+# ── Cross-month consistency helpers ──────────────────────────────────────────
+
+def _next_month_name_if_exists(year: int, month: int) -> str | None:
+    """Return 'June 2026' if a saved schedule for month+1 exists in DB, else None."""
+    try:
+        next_m = month % 12 + 1
+        next_y = year + (1 if month == 12 else 0)
+        if next_m not in SEASON_MONTHS:
+            return None
+        with db_session() as db:
+            exists = db.query(ScheduleORM).filter_by(year=next_y, month=next_m).first()
+            return f"{SEASON_MONTHS[next_m]} {next_y}" if exists else None
+    except Exception:
+        return None
+
+
+def _stale_prev_month_warning(schedule: "ScheduleRead") -> str | None:
+    """Return a warning string if the previous month was saved *after* this schedule
+    was created (meaning this schedule may not reflect the latest prev-month data).
+    Returns None if everything is in sync or no previous schedule exists.
+    """
+    try:
+        prev_m = schedule.month - 1
+        prev_y = schedule.year
+        if prev_m == 0:
+            prev_m = 12
+            prev_y -= 1
+        if prev_m not in SEASON_MONTHS:
+            return None
+        with db_session() as db:
+            prev_orm = (
+                db.query(ScheduleORM)
+                .filter_by(year=prev_y, month=prev_m)
+                .order_by(ScheduleORM.modified_at.desc())
+                .first()
+            )
+            if prev_orm is None or prev_orm.modified_at is None:
+                return None
+            if prev_orm.modified_at > schedule.created_at:
+                curr_name = f"{SEASON_MONTHS[schedule.month]} {schedule.year}"
+                prev_name = f"{SEASON_MONTHS[prev_m]} {prev_y}"
+                return (
+                    f"The **{prev_name}** schedule was modified after this **{curr_name}** "
+                    f"schedule was generated. Consider regenerating **{curr_name}** to ensure "
+                    "the consecutive-day constraints and cross-month carry-in are up to date."
+                )
+        return None
+    except Exception:
+        return None
 
 
 # ── Data loaders ──────────────────────────────────────────────────────────────
@@ -98,6 +152,8 @@ def _load_saved_schedule(year: int, month: int) -> ScheduleRead | None:
                 status=ScheduleStatus(orm.status),
                 created_at=orm.created_at, modified_at=orm.modified_at,
                 assignments=assignments,
+                is_fallback=getattr(orm, "is_fallback", False),
+                fallback_notes=getattr(orm, "fallback_notes", None),
             )
     except Exception:
         return None
@@ -117,6 +173,8 @@ def _save_schedule(schedule: ScheduleRead) -> bool:
                 status=schedule.status.value,
                 created_at=schedule.created_at,
                 modified_at=datetime.utcnow(),
+                is_fallback=getattr(schedule, "is_fallback", False),
+                fallback_notes=getattr(schedule, "fallback_notes", None),
             )
             db.add(orm)
             db.flush()
@@ -225,6 +283,38 @@ with main_col:
     # Flash banner when LLM Apply updates the grid
     if "_apply_flash" in st.session_state:
         st.success(f"✅ {st.session_state.pop('_apply_flash')} — schedule grid updated below")
+
+    # Cross-month warning: persisted across rerun (from Approve path)
+    if "_cross_month_warn_editor" in st.session_state:
+        st.warning(st.session_state.pop("_cross_month_warn_editor"))
+
+    # Cross-month stale warning: shown whenever prev month was edited after
+    # this schedule was generated (always-on check, no session state needed)
+    _stale = _stale_prev_month_warning(schedule)
+    if _stale:
+        st.warning(f"⚠️ {_stale}")
+
+    # Fallback banner: shown when schedule was generated in fallback mode
+    if getattr(schedule, "is_fallback", False):
+        _fb_notes = relaxation_notes_from_json(schedule.fallback_notes or "")
+        with st.container(border=True):
+            st.warning(
+                "⚠️ **Best-effort schedule** — this schedule was generated with relaxed "
+                "constraints because the normal solver could not find a valid solution "
+                "with the current number of available employees."
+            )
+            if _fb_notes:
+                st.markdown("**Constraints that were relaxed:**")
+                for _note in _fb_notes:
+                    st.markdown(f"- {_note}")
+        _gaps = staffing_gaps_from_json(schedule.fallback_notes or "")
+        if _gaps:
+            with st.expander(
+                f"📋 Staffing Gaps — {len(_gaps)} day(s) below normal requirements",
+                expanded=False,
+            ):
+                for _gap in _gaps:
+                    st.write(f"🔴 {_gap.description()}")
 
     st.subheader(f"Editing: {SEASON_MONTHS[schedule.month]} {schedule.year}  — Status: {schedule.status.value.upper()}")
 
@@ -353,6 +443,14 @@ with main_col:
     if save_clicked:
         if _save_schedule(schedule):
             st.success("Saved as draft.")
+            _next = _next_month_name_if_exists(schedule.year, schedule.month)
+            if _next:
+                curr_name = f"{SEASON_MONTHS[schedule.month]} {schedule.year}"
+                st.warning(
+                    f"⚠️ You have modified the **{curr_name}** schedule. "
+                    f"The **{_next}** schedule was generated based on the previous "
+                    f"version — consider regenerating **{_next}** to ensure consistency."
+                )
 
     if approve_clicked:
         if _save_schedule(schedule):
@@ -371,6 +469,14 @@ with main_col:
                 st.session_state["editor_schedule"] = approved
                 st.session_state["current_schedule"] = approved
                 st.success("Schedule approved! ✅")
+                _next = _next_month_name_if_exists(schedule.year, schedule.month)
+                if _next:
+                    curr_name = f"{SEASON_MONTHS[schedule.month]} {schedule.year}"
+                    st.session_state["_cross_month_warn_editor"] = (
+                        f"⚠️ You have modified the **{curr_name}** schedule. "
+                        f"The **{_next}** schedule was generated based on the previous "
+                        f"version — consider regenerating **{_next}** to ensure consistency."
+                    )
                 st.rerun()
             except Exception as e:
                 st.error(f"Approve failed: {e}")

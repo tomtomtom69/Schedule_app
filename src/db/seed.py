@@ -31,6 +31,8 @@ DEFAULT_SEASONS = [
         "opening_time": time(10, 0),
         "closing_time": time(17, 0),
         "production_start": time(8, 0),
+        "max_cafe_per_day": 5,
+        "max_prod_per_day": 4,
     },
     {
         "season": "mid",
@@ -39,6 +41,8 @@ DEFAULT_SEASONS = [
         "opening_time": time(9, 0),
         "closing_time": time(18, 0),
         "production_start": time(8, 0),
+        "max_cafe_per_day": 5,
+        "max_prod_per_day": 4,
     },
     {
         "season": "peak",
@@ -47,6 +51,8 @@ DEFAULT_SEASONS = [
         "opening_time": time(8, 30),
         "closing_time": time(20, 15),
         "production_start": time(8, 0),
+        "max_cafe_per_day": 5,
+        "max_prod_per_day": 4,
     },
     {
         "season": "low",
@@ -55,6 +61,8 @@ DEFAULT_SEASONS = [
         "opening_time": time(10, 0),
         "closing_time": time(18, 0),
         "production_start": time(8, 0),
+        "max_cafe_per_day": 5,
+        "max_prod_per_day": 4,
     },
 ]
 

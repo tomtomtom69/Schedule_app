@@ -63,6 +63,8 @@ class ScheduleRead(ScheduleBase):
     assignments: list[AssignmentRead] = []
     created_at: datetime
     modified_at: datetime | None = None
+    is_fallback: bool = False
+    fallback_notes: str | None = None  # JSON blob: {steps, notes, gaps}
 
     model_config = {"from_attributes": True}
 
@@ -79,6 +81,8 @@ class ScheduleORM(Base):
     status = Column(String, nullable=False, default=ScheduleStatus.draft.value)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     modified_at = Column(DateTime, nullable=True)
+    is_fallback = Column(Boolean, nullable=False, default=False)
+    fallback_notes = Column(Text, nullable=True)
 
     assignments = relationship("AssignmentORM", back_populates="schedule", cascade="all, delete-orphan")
 

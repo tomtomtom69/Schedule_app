@@ -12,6 +12,8 @@ from src.models.cruise_ship import CruiseShipORM
 from src.models.employee import EmployeeORM, EmployeeRead
 
 st.set_page_config(page_title="Employees", page_icon="👥", layout="wide")
+from src.ui.components.sidebar import render_shift_legend
+render_shift_legend()
 st.title("👥 Employees")
 
 # ── Unsaved data warning ──────────────────────────────────────────────────────
@@ -59,6 +61,7 @@ with tab_view:
                     "Role": e.role_capability.value if hasattr(e.role_capability, 'value') else e.role_capability,
                     "Type": e.employment_type.value if hasattr(e.employment_type, 'value') else e.employment_type,
                     "Hours/wk": e.contracted_hours,
+                    "DOB": str(e.date_of_birth) if getattr(e, "date_of_birth", None) else "—",
                     "Housing": e.housing,
                     "Languages": ", ".join(e.languages if isinstance(e.languages, list) else []),
                     "Available": f"{e.availability_start} – {e.availability_end}",
@@ -131,6 +134,7 @@ with tab_edit:
                     "languages": row.languages if isinstance(row.languages, list) else [],
                     "availability_start": row.availability_start,
                     "availability_end": row.availability_end,
+                    "date_of_birth": getattr(row, "date_of_birth", None),
                 } if row else None
 
             if emp:
@@ -182,6 +186,14 @@ with tab_edit:
                             min_value=date(2026, 5, 1),
                             max_value=date(2026, 10, 15),
                         )
+                        new_dob = st.date_input(
+                            "Date of Birth (optional — used for age-based constraints)",
+                            value=emp.get("date_of_birth"),
+                            min_value=date(1950, 1, 1),
+                            max_value=date(2015, 12, 31),
+                            format="YYYY-MM-DD",
+                            help="Required for employees under 18. Leave blank for adults.",
+                        )
 
                     col_save, col_delete = st.columns([3, 1])
                     save_clicked = col_save.form_submit_button("Save Changes", type="primary")
@@ -204,6 +216,7 @@ with tab_edit:
                                 orm.languages = langs
                                 orm.availability_start = new_avail_start
                                 orm.availability_end = new_avail_end
+                                orm.date_of_birth = new_dob
                         st.success(f"Updated {new_name}.")
                         st.rerun()
                     except Exception as e:
@@ -237,10 +250,13 @@ with tab_upload:
         **Required columns:**
         `name, languages, role_capability, employment_type, contracted_hours, housing, driving_licence, availability_start, availability_end`
 
+        **Optional column:** `date_of_birth` (YYYY-MM-DD) — required for employees under 18 to apply age-based constraints.
+
         **Example:**
         ```
-        name,languages,role_capability,employment_type,contracted_hours,housing,driving_licence,availability_start,availability_end
-        Aina,"english,spanish",both,full_time,37.5,eidsdal,true,2026-05-01,2026-10-15
+        name,languages,role_capability,employment_type,contracted_hours,housing,driving_licence,availability_start,availability_end,date_of_birth
+        Aina,"english,spanish",both,full_time,37.5,eidsdal,true,2026-05-01,2026-10-15,
+        Lars,english,cafe,part_time,20.0,geiranger,false,2026-06-01,2026-08-31,2010-03-15
         ```
         """
     )
@@ -295,6 +311,7 @@ with tab_upload:
                         "Role": r.role_capability.value if hasattr(r.role_capability, 'value') else r.role_capability,
                         "Type": r.employment_type.value if hasattr(r.employment_type, 'value') else r.employment_type,
                         "Hours": r.contracted_hours,
+                        "DOB": str(r.date_of_birth) if r.date_of_birth else "—",
                         "Housing": r.housing,
                         "Driver": r.driving_licence,
                         "Languages": ", ".join(r.languages),

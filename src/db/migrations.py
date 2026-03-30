@@ -1,5 +1,7 @@
 import logging
 
+from sqlalchemy import text
+
 from src.db.database import Base, engine
 
 logger = logging.getLogger(__name__)
@@ -14,6 +16,33 @@ def create_all_tables() -> None:
     logger.info("Creating database tables if they do not exist...")
     Base.metadata.create_all(bind=engine)
     logger.info("Database tables ready.")
+    run_safe_migrations()
+
+
+def run_safe_migrations() -> None:
+    """Add new columns to existing tables without data loss.
+
+    Uses 'ALTER TABLE … ADD COLUMN IF NOT EXISTS' which is idempotent on PostgreSQL.
+    Safe to run on every startup — does nothing if columns already exist.
+    """
+    migrations = [
+        # Section 1: employee date_of_birth
+        "ALTER TABLE employees ADD COLUMN IF NOT EXISTS date_of_birth DATE",
+        # Section 6: establishment staffing caps
+        "ALTER TABLE establishment_settings ADD COLUMN IF NOT EXISTS max_cafe_per_day INTEGER NOT NULL DEFAULT 5",
+        "ALTER TABLE establishment_settings ADD COLUMN IF NOT EXISTS max_prod_per_day INTEGER NOT NULL DEFAULT 4",
+        # Fallback mode flag and relaxation report
+        "ALTER TABLE schedules ADD COLUMN IF NOT EXISTS is_fallback BOOLEAN NOT NULL DEFAULT FALSE",
+        "ALTER TABLE schedules ADD COLUMN IF NOT EXISTS fallback_notes TEXT",
+    ]
+    try:
+        with engine.connect() as conn:
+            for sql in migrations:
+                conn.execute(text(sql))
+            conn.commit()
+        logger.info("Safe migrations applied.")
+    except Exception as exc:
+        logger.warning("Safe migration failed (may be harmless if using SQLite): %s", exc)
 
 
 def reset_all_tables() -> None:

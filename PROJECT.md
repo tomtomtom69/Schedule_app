@@ -7,8 +7,9 @@ A monthly staff scheduler for Geiranger Sjokolade, a chocolate café in Geirange
 1. Ingests cruise ship schedule data (Norwegian Excel files with a "Språk" column for languages)
 2. Calculates daily staffing demand (café workers + production workers) based on ship arrivals, season, port, and ship quality rating
 3. Solves a CP-SAT constraint-satisfaction model to produce a valid monthly schedule
-4. Lets the manager review, edit, approve, and export the schedule
-5. Provides an LLM chat assistant for schedule questions and adjustments
+4. Falls back to a progressively-relaxed solver if the normal model is INFEASIBLE
+5. Lets the manager review, edit, approve, and export the schedule
+6. Provides an LLM chat assistant for schedule questions and adjustments
 
 **Operating season:** 1 May – 15 October
 **App URL (local):** http://localhost:8510
@@ -30,7 +31,7 @@ A monthly staff scheduler for Geiranger Sjokolade, a chocolate café in Geirange
 **Starting the app:**
 ```bash
 docker compose up -d
-# or to rebuild:
+# or to rebuild after Dockerfile/requirements changes:
 docker compose up -d --build
 ```
 
@@ -72,10 +73,11 @@ Schedule_app/
 │   │   ├── shift_template.py      # ShiftTemplateBase/Create/Read/ORM
 │   │   ├── establishment.py       # EstablishmentSettingsBase/Read/ORM
 │   │   ├── schedule.py            # ScheduleORM, AssignmentORM, ScheduleRead, AssignmentRead
+│   │   │                          #   ScheduleRead has: is_fallback (bool), fallback_notes (str|None JSON)
 │   │   └── daily_demand.py        # DailyDemandORM (stored demand snapshots)
 │   ├── db/
 │   │   ├── database.py            # SQLAlchemy engine, Base, db_session context manager
-│   │   ├── migrations.py          # create_all_tables(), reset_all_tables()
+│   │   ├── migrations.py          # create_all_tables(), reset_all_tables(), run_safe_migrations()
 │   │   └── seed.py                # Seeds shift templates + default season settings
 │   ├── ingestion/
 │   │   ├── csv_parser.py          # parse_employees_csv(), parse_cruise_ships_csv()
@@ -91,7 +93,9 @@ Schedule_app/
 │   │   ├── transport.py           # Eidsdal transport hard constraints
 │   │   ├── validator.py           # Post-generation pure-Python validator → list[Violation]
 │   │   ├── scheduler.py           # ScheduleGenerator class (build_model + solve), SolveInfo
-│   │   └── __init__.py            # Public: ScheduleGenerator, validate_schedule, Violation
+│   │   ├── fallback.py            # run_fallback_solve(), FallbackResult, StaffingGap
+│   │   └── __init__.py            # Public: ScheduleGenerator, validate_schedule, Violation,
+│   │                              #         run_fallback_solve, FallbackResult, StaffingGap
 │   ├── llm/
 │   │   ├── prompts.py             # SYSTEM_PROMPT + all prompt builders
 │   │   ├── advisor.py             # ScheduleAdvisor class + apply_action() function
@@ -105,7 +109,7 @@ Schedule_app/
 │       │   ├── 1_settings.py      # Season configs, shift templates, Eidsdal settings
 │       │   ├── 2_employees.py     # Employee list, edit form, CSV upload
 │       │   ├── 3_cruise_ships.py  # Ship list, calendar view, CSV upload
-│       │   ├── 4_schedule.py      # Schedule generator + approval flow
+│       │   ├── 4_schedule.py      # Schedule generator + approval flow + fallback UI
 │       │   ├── 5_schedule_editor.py  # Interactive pivot-table editor
 │       │   └── 6_export.py        # Download Excel/PDF, validation dashboard, heatmap
 │       └── components/
@@ -127,7 +131,7 @@ Schedule_app/
 ## Data models
 
 ### Employee
-Fields: `id` (UUID), `name`, `languages` (list[str]), `role_capability` (cafe/production/both), `employment_type` (full_time/part_time), `contracted_hours` (float, weekly), `housing` (geiranger/eidsdal), `driving_licence` (bool), `availability_start` (date), `availability_end` (date), `preferences` (JSON dict).
+Fields: `id` (UUID), `name`, `languages` (list[str]), `role_capability` (cafe/production/both), `employment_type` (full_time/part_time), `contracted_hours` (float, weekly), `housing` (geiranger/eidsdal), `driving_licence` (bool), `availability_start` (date), `availability_end` (date), `date_of_birth` (date|None), `preferences` (JSON dict).
 
 ### CruiseShip
 Fields: `id`, `ship_name`, `date`, `arrival_time`, `departure_time`, `port` (enum), `size` (big/small), `good_ship` (bool), `extra_language` (str|None — comma-separated normalised language names, e.g. `"italian,spanish"`).
@@ -138,9 +142,20 @@ Fields: `id`, `ship_name`, `date`, `arrival_time`, `departure_time`, `port` (enu
 Fields: `id` (str, e.g. "1", "P1"), `role` (cafe/production), `label` (display name), `start_time`, `end_time`. Seeded by `src/db/seed.py`.
 
 ### Schedule / Assignment
-`ScheduleORM` has `month`, `year`, `status` (draft/approved), `created_at`, `modified_at`.
+`ScheduleORM` has `month`, `year`, `status` (draft/approved), `created_at`, `modified_at`, `is_fallback` (bool, default False), `fallback_notes` (text|None — JSON blob).
+
 `AssignmentORM` has `employee_id`, `date`, `shift_id`, `is_day_off` (bool), `notes`.
+
 The solver always creates day-off placeholder assignments for available employees who aren't working, so the grid always shows every employee for every available day.
+
+`fallback_notes` JSON schema:
+```json
+{
+  "steps": ["C"],
+  "notes": ["Language matching: already soft...", "Minimum staffing: reduced by 1..."],
+  "gaps": [{"date": "2026-05-04", "role": "cafe", "required": 4, "scheduled": 3}]
+}
+```
 
 ---
 
@@ -163,18 +178,92 @@ For each calendar day in the month that falls within the operating season:
 
 **`ScheduleGenerator(employees, demand, shifts, settings)`**
 
-1. `build_model()`: creates BoolVar for each compatible (employee, day, shift) triple, adds hard constraints, adds soft constraints + objective
-2. `solve()`: runs CP-SAT with 60s timeout; returns `ScheduleRead` or None if infeasible
+1. `build_model(disable_both_preference=False)`: creates BoolVar for each compatible (employee, day, shift) triple, adds hard constraints, adds soft constraints + objective
+2. `solve()`: runs CP-SAT with 60s timeout; returns `ScheduleRead` or None if infeasible/timeout
 
-**Hard constraints:** one shift/day per employee, daily staffing minimums, 48h weekly max, 11h daily rest, 35h weekly rest, role capability matching, availability dates, Eidsdal transport (max 10 per trip, driver required), **opening hours coverage** (≥1 café employee on a covering shift for every 1-hour slot within `opening_time`–`closing_time`; production same for slots with ≥2 covering shifts).
+**Hard constraints (in `constraints.py`):**
+- `add_one_shift_per_day` — at most one shift per employee per day
+- `add_daily_staffing_requirements` — minimum café/production headcount per day. **Capped to available employees**: `effective_min = min(demand.cafe_needed, actual_cafe_emps_today)` to prevent INFEASIBLE when headcount is below peak demand
+- `add_weekly_hour_limits` — 37.5h/week adults, 40h age 15-18, 35h under 15 (worked minutes, not raw duration)
+- `add_daily_rest` — 11h rest between end of one shift and start of the next day's shift
+- `add_weekly_rest` — rolling 7-day window: ≤6 working days (= 35h continuous rest)
+- `add_max_days_per_calendar_week` — ≤6 working days per Mon–Sun ISO week (explicit safety cap)
+- `add_max_consecutive_working_days` — no employee works >6 consecutive calendar days (rolling gap-aware 7-day windows)
+- `add_two_consecutive_days_off_per_14` — every rolling 14-day window must contain ≥1 pair of adjacent days off. Uses `pair_off_bv` BoolVars per (employee, day0) indicating both day0 and day0+1 are off
+- `add_cross_month_consecutive_constraint` — prevents >6-day runs spanning the M-1/M boundary. Loads M-1's last 6 working days per employee from DB; for each employee with carry_in K: adds `sum(shift_vars on days 1…{7-K} of M) ≤ 6-K`
+- `add_age_based_constraints` — under-15: only shift 6 allowed; 15-18: weekly cap only
+- `add_sunday_rest_constraints` — in any 4 consecutive Sundays/holidays, at most 3 worked
+- `add_max_staffing_caps` — upper cap: ≤5 café normally, ≤6 on good-ship days with ≥2 ships, ≤4 production
+- `add_opening_hours_coverage` — **NEVER RELAX**: ≥1 café employee covering each 1-hour slot within opening/closing times; ≥1 production employee for slots covered by ≥2 production shifts
+- `add_eidsdal_transport_constraints` — in `transport.py`; driver required when any Eidsdal employee works
 
-**Opening hours coverage detail:** `add_opening_hours_coverage()` in `constraints.py`. Settings auto-loaded from `EstablishmentSettings` DB table by `ScheduleGenerator._load_settings()`. For peak season (08:30–20:15): slot 08:30–09:30 is only covered by shift 1, slot 19:30–20:15 only by shift 5 — these single-shift slots force the solver to assign at least one person to each end of the day. Coverage is always ≥1 (no harbor-time elevation — total headcount is handled by the staffing constraint).
+**Opening hours coverage detail:** For peak season (08:30–20:15): slot 08:30–09:30 is only covered by shift 1 → forces ≥1 on early shift every day. Slot 19:30–20:15 only by shift 5 → forces ≥1 on late shift every day. The `if not cov_vars: continue` guard only skips when literally no employee has a variable for that slot (outside availability), not when employees are on rest days — rest is handled by the solver itself choosing when to schedule rest days.
 
-**Soft constraints (objective weights):** language coverage (100), full-time preference (±10), Eidsdal grouping (8), employee preferences (5), minimize overtime (3), fair hours distribution (5), **shift variety** (−2 penalty for same shift on consecutive days to encourage natural rotation).
+**Soft constraints (objective weights in `soft_constraints.py`):**
+- `language_coverage`: 100 — reward having a speaker on café when a ship language is required
+- `good_ship_day`: 60, `cruise_day`: 35, `no_cruise_day`: 15 — per-assignment rewards by demand level
+- `part_time_penalty`: 10 — deducted from day reward for part-time assignments
+- `both_on_production`: 20 — reward "both" employee on production; −20 on café (skipped when `disable_both_preference=True` in fallback Step D+)
+- `eidsdal_grouping`: 8 — reward Eidsdal workers on the same shift
+- `employee_preferences`: 5, `fair_distribution`: 5, `minimize_overtime`: 3
+- `shift_variety`: −2 — penalty for same shift on two consecutive days
+- `over_coverage_t1`: −3, `over_coverage_t2`: −5 — tiered penalty for each extra above daily min (spreading 2 extras across 2 days costs −6, concentrating on 1 day costs −8)
 
-**`SolveInfo`** dataclass captures: `status_name`, `num_variables`, `num_days`, `num_employees_available`, `num_working_assignments`, `wall_time`, `objective_value`, `diagnostics` (list[str]), `warnings` (list[str]).
+**`SolveInfo`** captures: `status_name`, `num_variables`, `num_days`, `num_employees_available`, `num_working_assignments`, `wall_time`, `objective_value`, `diagnostics` (list[str]), `warnings` (list[str]).
 
-**Pre-flight checks** (run before solving): employees with no availability overlap this month, language gaps, staffing capacity shortfalls. These populate `solve_info.warnings`.
+Properties: `is_success` (OPTIMAL/FEASIBLE + working > 0), `is_empty_solution` (OPTIMAL/FEASIBLE + working == 0).
+
+**Pre-flight checks** (run before solving): employees with no availability overlap, language gaps, staffing capacity shortfalls vs peak demand. These populate `solve_info.warnings`.
+
+---
+
+## Fallback solver (`src/solver/fallback.py`)
+
+When the normal solver returns INFEASIBLE, the UI shows diagnostics and a **"⚡ Generate Best-Effort Schedule"** button. When clicked, `run_fallback_solve()` tries 4 progressively looser models, stopping at the first feasible one.
+
+**Steps (each is a complete new solve attempt):**
+- **Step A** — Language: already soft in the main solver; noted in report, no re-solve
+- **Step B** — Reduce café/production minimums by 1 on **no-cruise days** only
+- **Step C** — Reduce café/production minimums by 1 on **all days**
+- **Step D** — Same demand as Step C + `disable_both_preference=True` (flex employees assigned freely)
+- **Step E** — Absolute floor: café minimum = 1 (where demand existed), production minimum = 0
+
+**Never relaxed in any fallback step:**
+- Opening hours coverage (≥1 in café per slot at all times)
+- Max 6 consecutive working days
+- Daily rest (11h) and weekly rest (35h / rolling 7-day)
+- Age-based shift restrictions
+- Max staffing caps (5–6 café, 4 production)
+- Eidsdal driver requirement
+
+**`FallbackResult`** dataclass: `schedule`, `steps_applied`, `relaxation_notes`, `staffing_gaps` (list[StaffingGap]).
+
+**`StaffingGap`** dataclass: `date`, `role`, `required` (original demand), `scheduled` (what fallback assigned).
+
+`FallbackResult.notes_json()` serialises to JSON for storage in `ScheduleORM.fallback_notes`.
+
+`staffing_gaps_from_json()` and `relaxation_notes_from_json()` reconstruct from stored JSON (used when loading from DB after a session restart).
+
+**UI integration (`4_schedule.py`):**
+- After INFEASIBLE: diagnostics expander stays visible + fallback button appears
+- `_inf_info`, `_inf_demand`, `_inf_year`, `_inf_month` stored in session state
+- After fallback success: `ScheduleRead` has `is_fallback=True`, `fallback_notes=JSON`
+- Yellow bordered banner + collapsible staffing gaps expander shown whenever `schedule.is_fallback`
+- Same banner shown in `5_schedule_editor.py`
+- Excel export (row 3): yellow warning note when `is_fallback`
+
+---
+
+## Cross-month edit warnings
+
+Two helpers in both `4_schedule.py` and `5_schedule_editor.py`:
+
+- `_next_month_name_if_exists(year, month)` — queries DB; returns "June 2026" if M+1 exists
+- `_stale_prev_month_warning(schedule)` — compares `prev_orm.modified_at > schedule.created_at`; returns warning string if true
+
+Warnings shown:
+1. **Inline after Save Draft / Approve** — if M+1 exists, warn that M+1 may be stale
+2. **Always-on banner** — if M-1 was modified after M was generated, warn to regenerate M
 
 ---
 
@@ -189,6 +278,30 @@ Action dict: `{"action": "assign"|"unassign"|"day_off", "employee": str, "date":
 `apply_action(action, schedule, employees, demand, shift_templates)` → `(new_schedule, warnings)`
 
 The chat panel (`chat_panel.py`) strips JSON from displayed text before showing it, renders action proposals as clickable cards, and saves to DB after each apply.
+
+---
+
+## DB migrations
+
+All schema changes are applied via `run_safe_migrations()` in `src/db/migrations.py`, using `ALTER TABLE … ADD COLUMN IF NOT EXISTS` (idempotent, safe to run on startup).
+
+Current migrations:
+- `employees.date_of_birth DATE`
+- `establishment_settings.max_cafe_per_day INTEGER NOT NULL DEFAULT 5`
+- `establishment_settings.max_prod_per_day INTEGER NOT NULL DEFAULT 4`
+- `schedules.is_fallback BOOLEAN NOT NULL DEFAULT FALSE`
+- `schedules.fallback_notes TEXT`
+
+To reset the entire DB (destroys all data):
+```bash
+docker exec geiranger-scheduler-app python -c "
+from src.db.migrations import reset_all_tables
+from src.db.seed import seed_defaults
+reset_all_tables()
+seed_defaults()
+print('Done')
+"
+```
 
 ---
 
@@ -213,6 +326,6 @@ LLM_MAX_TOKENS=4096
 1. **Settings** — verify season dates and shift templates are seeded correctly
 2. **Employees** — upload employee CSV (one-time; re-upload to update)
 3. **Cruise Ships** — upload ship schedule CSV (from the port authority / Excel export)
-4. **Schedule** — select month, click Generate, review solver diagnostics, Save Draft or Approve & Finalize
+4. **Schedule** — select month, click Generate; if FEASIBLE → review and Save/Approve; if INFEASIBLE → view diagnostics and optionally generate best-effort
 5. **Schedule Editor** — fine-tune individual assignments in the pivot grid
 6. **Export** — download Excel (Vaktlista format) or PDF after approval

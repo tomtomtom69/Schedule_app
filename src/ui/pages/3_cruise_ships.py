@@ -10,6 +10,8 @@ from src.models.cruise_ship import CruiseShipORM, CruiseShipRead
 from src.models.employee import EmployeeORM
 
 st.set_page_config(page_title="Cruise Ships", page_icon="🚢", layout="wide")
+from src.ui.components.sidebar import render_shift_legend
+render_shift_legend()
 st.title("🚢 Cruise Ships")
 
 # ── Unsaved data warning ──────────────────────────────────────────────────────

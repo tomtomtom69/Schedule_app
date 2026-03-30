@@ -66,9 +66,8 @@ def _apply(cell, value=None, fill=None, font=None, align=None, border=None):
 
 
 def _shift_hours(shift: ShiftTemplateRead) -> float:
-    s = shift.start_time.hour * 60 + shift.start_time.minute
-    e = shift.end_time.hour * 60 + shift.end_time.minute
-    return (e - s) / 60.0
+    """Return worked hours for a shift (template duration minus 0.5h mandatory break)."""
+    return shift.worked_hours
 
 
 # ── Main export function ─────────────────────────────────────────────────────
@@ -133,7 +132,22 @@ def export_schedule_to_excel(
            font=_font(bold=True, color="FFFFFF", size=12),
            align=_align("left"))
 
-    current_row = 4  # leave row 3 for opening hours (populated later)
+    # Row 3: fallback warning note (only when schedule was generated in fallback mode)
+    if getattr(schedule, "is_fallback", False):
+        ws.merge_cells("A3:P3")
+        _apply(
+            ws["A3"],
+            value=(
+                "⚠ NOTE: This schedule was generated with relaxed constraints due to "
+                "insufficient staff. Review highlighted gaps before publishing."
+            ),
+            fill=_fill("FFF2CC"),   # yellow
+            font=_font(bold=True, color="7B6000", size=10),
+            align=_align("left"),
+        )
+        current_row = 5  # push schedule blocks down one row
+    else:
+        current_row = 4  # leave row 3 empty (reserved)
 
     # ── Write each half ───────────────────────────────────────────────────────
     legend_written = False

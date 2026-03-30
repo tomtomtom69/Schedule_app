@@ -208,7 +208,7 @@ def render_chat_panel(
     with msg_container:
         if not messages:
             st.markdown(
-                "<div style='color:#999;font-size:12px;text-align:center;margin-top:60px;'>"
+                "<div style='color:#888;font-size:12px;text-align:center;margin-top:60px;'>"
                 "Ask me anything about the schedule.<br>"
                 "E.g. «Why is Eva on P2 on August 7?»<br>"
                 "or «Give Alice a day off on August 15»</div>",
@@ -219,7 +219,7 @@ def render_chat_panel(
             role_icon = "🧑" if msg["role"] == "user" else "🤖"
             bg = "#E8F4FF" if msg["role"] == "assistant" else "#F0F0F0"
             st.markdown(
-                f"<div style='background:{bg};border-radius:8px;padding:8px 12px;"
+                f"<div style='background:{bg};color:#1a1a1a;border-radius:8px;padding:8px 12px;"
                 f"margin:4px 0;font-size:13px;'>"
                 f"<b>{role_icon}</b> {msg['content']}</div>",
                 unsafe_allow_html=True,
@@ -328,7 +328,7 @@ def _render_action_cards(
     pending = [j for j in range(len(actions)) if (msg_idx, j) not in applied and (msg_idx, j) not in failed]
     if pending:
         st.markdown(
-            "<div style='background:#FFF9C4;border-left:4px solid #F9A825;border-radius:4px;"
+            "<div style='background:#FFF9C4;color:#7B6000;border-left:4px solid #F9A825;border-radius:4px;"
             "padding:6px 10px;margin:4px 0;font-size:12px;'>"
             "<b>📋 Proposed changes — review and apply individually or all at once:</b></div>",
             unsafe_allow_html=True,
@@ -341,7 +341,7 @@ def _render_action_cards(
         if card_key in applied:
             # In-place success feedback
             st.markdown(
-                f"<div style='background:#D4EDDA;border-left:4px solid #28A745;border-radius:6px;"
+                f"<div style='background:#D4EDDA;color:#155724;border-left:4px solid #28A745;border-radius:6px;"
                 f"padding:6px 10px;margin:2px 0;font-size:12px;'>✅ Applied: {desc}</div>",
                 unsafe_allow_html=True,
             )
@@ -349,7 +349,7 @@ def _render_action_cards(
             # In-place error feedback
             err = failed[card_key]
             st.markdown(
-                f"<div style='background:#F8D7DA;border-left:4px solid #DC3545;border-radius:6px;"
+                f"<div style='background:#F8D7DA;color:#721c24;border-left:4px solid #DC3545;border-radius:6px;"
                 f"padding:6px 10px;margin:2px 0;font-size:12px;'>❌ Failed: {err}</div>",
                 unsafe_allow_html=True,
             )
@@ -358,7 +358,7 @@ def _render_action_cards(
             card_col, btn_col = st.columns([5, 1])
             with card_col:
                 st.markdown(
-                    f"<div style='background:#F5F5F5;border-radius:6px;padding:6px 10px;"
+                    f"<div style='background:#F5F5F5;color:#1a1a1a;border-radius:6px;padding:6px 10px;"
                     f"margin:2px 0;font-size:12px;'>→ {desc}</div>",
                     unsafe_allow_html=True,
                 )
