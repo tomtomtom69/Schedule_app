@@ -4,7 +4,8 @@
       "Bash(find C:/Users/goran/AI_PROJECTS/Bengts_scheduler/Schedule_app -name docker-compose* -o -name Dockerfile -o -name .env)",
       "Bash(docker exec:*)",
       "Bash(python -c \":*)",
-      "Bash(docker ps:*)"
+      "Bash(docker ps:*)",
+      "Bash(grep -v \"^$\")"
     ]
   }
 }

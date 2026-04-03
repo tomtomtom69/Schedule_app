@@ -82,6 +82,7 @@ class ScheduleGenerator:
         demand: list[DailyDemand],
         shift_templates: list[ShiftTemplateRead],
         settings: EstablishmentSettingsRead | list[EstablishmentSettingsRead] | None = None,
+        closed_days: "set[date] | None" = None,
     ) -> None:
         self.employees = employees
         self.demand = demand
@@ -91,24 +92,73 @@ class ScheduleGenerator:
         self.variables: Variables = {}
         self.solve_info = SolveInfo()
 
+        # Closed days are excluded from all scheduling logic — they act as gaps that
+        # naturally break consecutive-day windows.
+        _closed = closed_days or set()
+
         # Derived state populated during build
-        self._days: list[date] = sorted(d.date for d in demand)
-        self._demand_map: dict[date, DailyDemand] = {d.date: d for d in demand}
+        self._days: list[date] = sorted(d.date for d in demand if d.date not in _closed)
+        self._demand_map: dict[date, DailyDemand] = {d.date: d for d in demand if d.date not in _closed}
         # Previous month's working dates — loaded during build_model for cross-month constraints
         self._prev_month_working: dict[str, set[date]] = {}
 
+        # Log closed-days summary so the UI diagnostics can confirm they were applied
+        if _closed:
+            logger.info(
+                "Closed days excluded from model (%d total): %s",
+                len(_closed),
+                ", ".join(str(d) for d in sorted(_closed)),
+            )
+        logger.info(
+            "Open days this month: %d  (demand entries before closed-day filter: %d)",
+            len(self._days),
+            len(demand),
+        )
+        # Log staffing minimums from demand so the user can verify rules loaded correctly
+        if self._demand_map:
+            for d in sorted(self._demand_map)[:3]:  # first 3 days as sample
+                dd = self._demand_map[d]
+                logger.info(
+                    "Demand sample %s (%s): cafe_needed=%d, production_needed=%d",
+                    d, dd.season.value if hasattr(dd.season, "value") else dd.season,
+                    dd.cafe_needed, dd.production_needed,
+                )
+
     # ── Public interface ─────────────────────────────────────────────────────
 
-    def build_model(self, disable_both_preference: bool = False) -> None:
+    def build_model(
+        self,
+        disable_both_preference: bool = False,
+        skeleton_mode: bool = False,
+    ) -> None:
         """Build the complete CP-SAT model: variables + hard + soft constraints.
 
         disable_both_preference: passed through to soft constraints; used in
         fallback Step D to allow 'both' employees to cover café freely.
+
+        skeleton_mode: when True (fallback Pass 3), drops complex constraints
+        (opening hours coverage, two-consecutive-days-off-per-14, Sunday rest,
+        max staffing caps) and replaces the full soft objective with a simple
+        "minimize total working assignments" to give employees maximum rest.
+        Only the absolute legal minimums are enforced.
         """
         self._disable_both_preference = disable_both_preference
+        self._skeleton_mode = skeleton_mode
         # Load establishment settings if not provided — needed for coverage constraints
         if self.settings is None:
             self.settings = self._load_settings()
+
+        # Log the distinct staffing minimums visible in demand (confirms DB rules loaded)
+        if self._demand_map:
+            seen: set[tuple] = set()
+            for dd in self._demand_map.values():
+                seen.add((
+                    dd.season.value if hasattr(dd.season, "value") else str(dd.season),
+                    dd.cafe_needed,
+                    dd.production_needed,
+                ))
+            rules_lines = [f"{s}: cafe≥{c}, prod≥{p}" for s, c, p in sorted(seen)]
+            logger.info("Staffing minimums from demand (DB rules applied): %s", " | ".join(rules_lines))
 
         # Load previous month's working dates for cross-month consecutive-day constraint
         if self._days:
@@ -123,7 +173,10 @@ class ScheduleGenerator:
         self._create_variables()
         self._pre_flight_checks()
         self._add_hard_constraints()
-        self._add_soft_constraints()
+        if skeleton_mode:
+            self._add_skeleton_objective()
+        else:
+            self._add_soft_constraints()
 
         n_vars = len(self.variables)
         n_days = len(self._days)
@@ -284,6 +337,8 @@ class ScheduleGenerator:
             )
 
     def _add_hard_constraints(self) -> None:
+        skeleton = getattr(self, "_skeleton_mode", False)
+
         add_one_shift_per_day(self.model, self.variables, self.employees, self.shifts, self._days)
         add_daily_staffing_requirements(
             self.model, self.variables, self._demand_map,
@@ -302,18 +357,20 @@ class ScheduleGenerator:
         add_max_consecutive_working_days(
             self.model, self.variables, self.employees, self.shifts, self._days
         )
-        # Constraint 2b: cross-month consecutive-days constraint — prevents runs that start
-        # at the end of the previous month and continue into the first days of this month
+        # Constraint 2b: cross-month consecutive-days constraint
         n_cross = add_cross_month_consecutive_constraint(
             self.model, self.variables, self.employees, self.shifts,
             self._days, self._prev_month_working,
         )
         logger.info("Cross-month consecutive-day constraints added: %d", n_cross)
-        # Constraint 3: ≥2 consecutive days off in every rolling 14-day window
-        add_two_consecutive_days_off_per_14(
-            self.model, self.variables, self.employees, self.shifts, self._days
-        )
-        # NOTE: language matching is now a SOFT constraint (see soft_constraints.py)
+
+        if not skeleton:
+            # Constraint 3: ≥2 consecutive days off in every rolling 14-day window
+            # (dropped in skeleton mode — too heavy, not absolute legal minimum)
+            add_two_consecutive_days_off_per_14(
+                self.model, self.variables, self.employees, self.shifts, self._days
+            )
+
         add_role_capability(self.model, self.variables, self.employees, self.shifts)
         add_availability(self.model, self.variables, self.employees, self._days)
         add_eidsdal_transport_constraints(
@@ -323,26 +380,51 @@ class ScheduleGenerator:
         add_age_based_constraints(
             self.model, self.variables, self.employees, self.shifts, self._days
         )
-        # Section 7: Sunday/holiday rest rules
-        add_sunday_rest_constraints(
-            self.model, self.variables, self.employees, self.shifts, self._days
-        )
+
+        if not skeleton:
+            # Section 7: Sunday/holiday rest rules (soft-ish legal requirement; dropped
+            # in skeleton mode to maximise feasibility)
+            add_sunday_rest_constraints(
+                self.model, self.variables, self.employees, self.shifts, self._days
+            )
+
         settings_list = self.settings if isinstance(self.settings, list) else (
             [self.settings] if self.settings else []
         )
-        # Section 6: maximum staffing caps per day
-        max_cafe = min((s.max_cafe_per_day for s in settings_list), default=5)
-        max_prod = min((s.max_prod_per_day for s in settings_list), default=4)
-        add_max_staffing_caps(
-            self.model, self.variables, self._demand_map,
-            self.employees, self.shifts, self._days,
-            default_max_cafe=max_cafe,
-            default_max_prod=max_prod,
-        )
+
+        if not skeleton:
+            # Section 6: maximum staffing caps per day
+            max_cafe = min((s.max_cafe_per_day for s in settings_list), default=5)
+            max_prod = min((s.max_prod_per_day for s in settings_list), default=4)
+            add_max_staffing_caps(
+                self.model, self.variables, self._demand_map,
+                self.employees, self.shifts, self._days,
+                default_max_cafe=max_cafe,
+                default_max_prod=max_prod,
+            )
+
+        # Opening hours coverage is ALWAYS enforced — "never relax" category alongside
+        # legal rest periods and consecutive-day caps.  Even in skeleton mode the café
+        # must cover every 1-hour slot from opening_time to closing_time with ≥1
+        # employee.  The constraint already guards against empty cov_vars per slot so
+        # it stays feasible when headcount is at its absolute minimum.
         add_opening_hours_coverage(
             self.model, self.variables, self.employees, self.shifts,
             self._days, self._demand_map, settings_list,
         )
+
+    def _add_skeleton_objective(self) -> None:
+        """Skeleton mode objective: maximise total working assignments.
+
+        Opening hours coverage is enforced as a hard constraint even in skeleton mode,
+        so the solver must cover every operating-hour slot.  This objective then fills
+        remaining capacity to give employees as many shifts as possible (contracted
+        hours) rather than the previous minimise-assignments approach that left
+        employees severely under-rostered.
+        """
+        all_vars = list(self.variables.values())
+        if all_vars:
+            self.model.Maximize(sum(all_vars))
 
     def _add_soft_constraints(self) -> None:
         add_soft_constraints(
@@ -482,6 +564,35 @@ class ScheduleGenerator:
                 f"Production shortfall: peak demand={max_prod} but only "
                 f"{len(prod_emps)} production-capable employee(s) available."
             )
+
+        # Check for cafe/production dual-role conflict: a day where the sum of
+        # café_needed + prod_needed exceeds available workers, because the only
+        # production-capable employees are also the only way to hit café minimum.
+        for d in self._days:
+            dd = self._demand_map.get(d)
+            if not dd or (dd.cafe_needed == 0 and dd.production_needed == 0):
+                continue
+            avail = [
+                e for e in self.employees
+                if e.availability_start <= d <= e.availability_end
+            ]
+            n_cafe_capable = sum(
+                1 for e in avail
+                if e.role_capability in (RoleCapability.cafe, RoleCapability.both)
+            )
+            n_prod_capable = sum(
+                1 for e in avail
+                if e.role_capability in (RoleCapability.production, RoleCapability.both)
+            )
+            n_total = len(avail)
+            # If café_needed + prod_needed > total workers, impossible by pigeonhole
+            if n_total < dd.cafe_needed + dd.production_needed:
+                hints.append(
+                    f"{d}: impossible — need {dd.cafe_needed} café + "
+                    f"{dd.production_needed} production = {dd.cafe_needed + dd.production_needed} workers "
+                    f"but only {n_total} employee(s) available. "
+                    "Close this day or reduce staffing rules for this season."
+                )
 
         if not hints:
             hints.append(

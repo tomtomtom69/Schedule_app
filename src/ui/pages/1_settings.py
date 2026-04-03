@@ -10,6 +10,7 @@ from src.db.database import db_session
 from src.demand.seasonal_rules import STAFFING_RULES, Season
 from src.models.establishment import EstablishmentSettingsORM
 from src.models.shift_template import ShiftTemplateORM
+from src.models.staffing_rule import StaffingRuleORM
 
 st.set_page_config(page_title="Settings", page_icon="⚙️", layout="wide")
 from src.ui.components.sidebar import render_shift_legend
@@ -188,26 +189,102 @@ with tab2:
 with tab3:
     st.subheader("Staffing Rules")
     st.caption(
-        "Shows the default staffing levels per season and scenario from the demand engine. "
-        "These are code-defined defaults in Phase 4. "
-        "DB-editable overrides will be added in a future phase."
+        "Minimum staffing levels per season and scenario. "
+        "Changes take effect on the next schedule generation."
     )
 
-    for season in [Season.low, Season.mid, Season.peak]:
-        rules = STAFFING_RULES.get(season, {})
-        st.markdown(f"**{season.value.upper()} Season**")
-        rows = []
-        for scenario, counts in rules.items():
-            rows.append({
-                "Scenario": scenario.replace("_", " ").title(),
-                "Production": counts.get("production", 0),
-                "Café": counts.get("cafe", 0),
-                "Total": counts.get("production", 0) + counts.get("cafe", 0),
-            })
-        if rows:
+    try:
+        with db_session() as db:
+            rule_rows = db.query(StaffingRuleORM).order_by(
+                StaffingRuleORM.season, StaffingRuleORM.scenario
+            ).all()
+
+        if rule_rows:
+            df_rules = pd.DataFrame([
+                {
+                    "ID": r.id,
+                    "Season": r.season.upper(),
+                    "Scenario": r.scenario.replace("_", " ").title(),
+                    "Café Min": r.cafe_needed,
+                    "Production Min": r.production_needed,
+                }
+                for r in rule_rows
+            ])
+        else:
+            # Fallback to hardcoded display
+            rows = []
+            for season in [Season.low, Season.mid, Season.peak]:
+                for scenario, counts in STAFFING_RULES.get(season, {}).items():
+                    rows.append({
+                        "ID": None,
+                        "Season": season.value.upper(),
+                        "Scenario": scenario.replace("_", " ").title(),
+                        "Café Min": counts.get("cafe", 0),
+                        "Production Min": counts.get("production", 0),
+                    })
             df_rules = pd.DataFrame(rows)
-            st.dataframe(df_rules, use_container_width=True, hide_index=True)
+
+        edited_rules = st.data_editor(
+            df_rules,
+            use_container_width=True,
+            column_config={
+                "ID": st.column_config.NumberColumn("ID", disabled=True),
+                "Season": st.column_config.TextColumn("Season", disabled=True),
+                "Scenario": st.column_config.TextColumn("Scenario", disabled=True),
+                "Café Min": st.column_config.NumberColumn(
+                    "Café Min",
+                    min_value=0, max_value=20,
+                    help="Minimum café staff required for this scenario.",
+                ),
+                "Production Min": st.column_config.NumberColumn(
+                    "Production Min",
+                    min_value=0, max_value=20,
+                    help="Minimum production staff required for this scenario.",
+                ),
+            },
+            hide_index=True,
+            num_rows="fixed",
+            key="rules_editor",
+        )
+
+        if st.button("Save Staffing Rules", type="primary"):
+            try:
+                with db_session() as db:
+                    for _, row in edited_rules.iterrows():
+                        rid = row.get("ID")
+                        if rid is None or (isinstance(rid, float) and pd.isna(rid)):
+                            continue
+                        orm = db.query(StaffingRuleORM).filter_by(id=int(rid)).first()
+                        if orm is None:
+                            continue
+                        orm.cafe_needed = int(row["Café Min"])
+                        orm.production_needed = int(row["Production Min"])
+                st.success("Staffing rules saved.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Save failed: {e}")
+
+        # ── Verification: re-read from DB and display saved values ────────────
         st.divider()
+        st.caption("**Saved values (read back from database):**")
+        try:
+            with db_session() as db:
+                verify_rows = db.query(StaffingRuleORM).order_by(
+                    StaffingRuleORM.season, StaffingRuleORM.scenario
+                ).all()
+            if verify_rows:
+                lines = [
+                    f"**{r.season.upper()}** / {r.scenario}: café ≥ {r.cafe_needed}, production ≥ {r.production_needed}"
+                    for r in verify_rows
+                ]
+                st.markdown("  \n".join(lines))
+            else:
+                st.warning("No staffing rules in database — defaults will be used.")
+        except Exception as e:
+            st.warning(f"Could not verify saved rules: {e}")
+
+    except Exception as e:
+        st.error(f"Could not load staffing rules: {e}")
 
 
 # ── Tab 4: Eidsdal Transport Settings ────────────────────────────────────────

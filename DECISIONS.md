@@ -571,6 +571,282 @@ must call `st.set_page_config()` as its first Streamlit call.
 
 ---
 
+### 29. CSV parser — tolerant real-world input
+**Decision:** `parse_employees_csv()` in `src/ingestion/csv_parser.py` was rewritten to be
+highly tolerant of imperfect data and returns a 3-tuple `(records, errors, corrections)`.
+
+**Key behaviours:**
+- Accepts `age` OR `date_of_birth` column; parses dates in YYYY-MM-DD, DD-MM-YYYY, D MMM YYYY,
+  D MMMM YYYY, Norwegian month names (jan/feb/mars/apr/mai/jun/jul/aug/sep/okt/nov/des),
+  and plain integers (interpreted as age → computed as `today - age years`).
+- Accepts `Cafe/café/Caf/Kafe → "cafe"`, `Production/Manager Production → "production"`,
+  `Both/Begge → "both"` — all case-insensitive.
+- Accepts `part-time/Part-time/part_time` for `employment_type`.
+- Accepts `1/0/yes/no/true/false/TRUE/FALSE/ja/nei` for `driving_licence`.
+- Normalises `housing` case-insensitively.
+- Normalises language names to lowercase; auto-adds "english" if missing; splits on `;` or `,`.
+- Skips blank rows silently.
+- Collects per-row correction notes (e.g. `"Normalised: Caf → cafe, 1 → true"`) returned
+  as the third element of the tuple.
+
+**Return type change:** `EmployeeParseResult = tuple[list, list[dict], list[str]]`
+The calling page (`2_employees.py`) unpacks: `records, errors, corrections = parse_employees_csv(uploaded)`.
+
+**Where:** `src/ingestion/csv_parser.py` — `_ROLE_MAP`, `_EMPTYPE_MAP`, `_MONTH_NAMES`,
+`_DOB_FORMATS`, `_normalize_role`, `_normalize_emptype`, `_normalize_housing`,
+`_coerce_bool_noted`, `_parse_dob`, `_normalize_languages`, `_is_blank_row`.
+`src/ui/pages/2_employees.py` — corrections expander added under the upload tab.
+
+---
+
+### 30. dayfirst=True pandas date parsing bug — fixed with explicit strptime
+**Bug:** `pd.to_datetime("2026-05-01", dayfirst=True)` returned January 5, 2026 instead of
+May 1, 2026 — swapping day and month in ISO-format strings that have day ≤ 12.
+
+**Fix:** Replaced direct pandas usage in `_parse_date_field()` with a custom `_parse_dob()`
+that tries each explicit `strptime` format in order. ISO format (`%Y-%m-%d`) is tried first
+before any fuzzy/dayfirst parsing. Pandas `dayfirst=True` is never used on availability dates.
+
+**Where:** `src/ingestion/csv_parser.py` — `_parse_dob()`, `_parse_date_field()`.
+
+**Rule:** Never use `pd.to_datetime(..., dayfirst=True)` on fields that could be ISO-format
+dates. Always use explicit `datetime.strptime(val, "%Y-%m-%d")` first.
+
+---
+
+### 31. Staffing rules stored in DB, editable in Settings
+**Decision:** Minimum staffing counts (café/production per season/scenario) are stored in a
+`staffing_rules` DB table rather than only as hardcoded Python constants. The table is seeded
+from `STAFFING_RULES` on first run (if empty). The Settings page Tab 3 provides an editable
+`st.data_editor` grid.
+
+**Why:** The business owner needs to adjust staffing levels (e.g. add 1 café worker on all
+peak days) without touching code. The DB is the source of truth at runtime; the hardcoded
+`STAFFING_RULES` dict is the fallback.
+
+**Flow:** `generate_monthly_demand()` calls `load_staffing_rules_from_db()` (in
+`seasonal_rules.py`) which queries the DB, merges any missing keys from hardcoded defaults,
+and returns the same nested-dict structure. Transparent to callers.
+
+**Where:**
+- `src/models/staffing_rule.py` — `StaffingRuleORM` with `UniqueConstraint("season","scenario")`
+- `src/demand/seasonal_rules.py` — `load_staffing_rules_from_db()` (lazy DB import to avoid circulars)
+- `src/db/seed.py` — `seed_staffing_rules()` (idempotent, only inserts if count=0)
+- `src/db/migrations.py` — `CREATE TABLE IF NOT EXISTS staffing_rules (...)`
+- `src/demand/forecaster.py` — `generate_monthly_demand()` now accepts `rules: dict | None = None`
+- `src/ui/pages/1_settings.py` — Tab 3 replaced with editable data_editor
+
+---
+
+### 32. Closed days — solver skip + grey grid columns
+**Decision:** A `closed_days` DB table lets the manager mark specific dates as shop-closed.
+Closed days are completely skipped by the demand engine (no assignments generated) and
+displayed as locked grey columns in the schedule grid and Excel export.
+
+**Why closed days count as rest automatically:** The demand engine produces no `DailyDemand`
+entries for closed days, so the solver's `_days` list has a gap. The consecutive-day
+constraint only fires on windows of exactly 7 consecutive calendar days — a gap breaks
+the window, so the closed day implicitly provides rest without an explicit "day off" assignment.
+
+**UI:** Expandable "🔒 Closed Days" section above the Generate button on the Schedule page.
+A weekly checkbox grid (Mon–Sun, padded) lets the manager toggle dates. State is kept in
+`st.session_state[f"closed_days_{year}_{month}"]` (loaded from DB on first access). Save
+button calls `save_closed_days()` which replaces the month's records atomically.
+
+**Grid rendering:** `build_schedule_html()` and `render_schedule_grid()` accept
+`closed_days: set[date] | None`. Closed columns get a grey 🔒 header; employee cells show
+`—` in grey; cruise info shows "CLOSED" in the Ships row only.
+
+**Excel:** Same grey treatment with `COLORS["closed"] = "CCCCCC"` in both half-blocks.
+
+**Where:**
+- `src/models/closed_day.py` — `ClosedDayORM` (UUID pk, date UNIQUE, year, reason nullable)
+- `src/db/migrations.py` — `CREATE TABLE IF NOT EXISTS closed_days (...)`
+- `src/demand/forecaster.py` — `generate_monthly_demand(closed_days=...)` skips closed dates
+- `src/solver/scheduler.py` — `__init__(closed_days=...)` filters `_days` and `_demand_map`
+- `src/ui/components/schedule_grid.py` — `build_schedule_html`, `_employee_row_html`, `_cruise_info_rows_html`, `render_schedule_grid` all accept `closed_days`
+- `src/export/excel_export.py` — `export_schedule_to_excel(closed_days=...)` passes through to half-writers
+- `src/ui/pages/4_schedule.py` — `load_closed_days()`, `save_closed_days()` helpers; closed days calendar UI; `_closed_days` wired to generate/load/render calls
+
+---
+
+### 33. Skeleton mode — last-resort fallback pass
+**Decision:** After Steps B/C/D/E all fail, a final "Skeleton Mode" pass runs with the
+absolute minimum constraints. This ensures *some* schedule is always returned rather than
+a total failure.
+
+**What skeleton mode does:**
+- Sets café minimum = 1 per open day, production minimum = 0 on all days
+- Drops: `add_two_consecutive_days_off_per_14`, `add_sunday_rest_constraints`,
+  `add_max_staffing_caps`, `add_opening_hours_coverage`
+- Uses **`model.Minimize(sum_of_all_vars))`** instead of the normal maximise objective
+  (gives employees maximum rest)
+- `disable_both_preference=True` (flex employees freely assigned)
+
+**Implementation:**
+- `ScheduleGenerator.build_model(skeleton_mode=True)` — stores flag, skips 4 complex constraints,
+  calls `_add_skeleton_objective()` instead of `_add_soft_constraints()`
+- `src/solver/fallback.py` — Skeleton step after E; `FallbackResult.is_skeleton` property;
+  `is_skeleton_from_json(fallback_notes_json)` helper for loading from DB
+
+**UI:**
+- Red `st.error` banner ("🚨 SKELETON SCHEDULE") instead of yellow warning
+- Staffing gaps expander auto-expanded (`expanded=True`) for skeleton
+- Caption lists the four dropped constraints
+
+**Where:** `src/solver/scheduler.py`, `src/solver/fallback.py`, `src/ui/pages/4_schedule.py`.
+
+---
+
+---
+
+### 34. Skeleton mode objective changed: minimize → maximize
+**Decision:** Changed `_add_skeleton_objective()` from `model.Minimize(sum_of_all_vars)`
+to `model.Maximize(sum_of_all_vars)`.
+
+**Why:** The original minimize-assignments objective left employees severely under-rostered
+(solver assigns the bare legal minimum). Skeleton mode is the last resort — employees
+should still get as close to their contracted hours as possible within the relaxed constraints.
+
+**Where:** `src/solver/scheduler.py` — `_add_skeleton_objective()`.
+
+---
+
+### 35. Opening hours coverage always enforced — even in skeleton mode
+**Decision:** `add_opening_hours_coverage()` moved outside the `if not skeleton:` block.
+It is now called unconditionally in `_add_hard_constraints()`.
+
+**Why:** Without it the solver puts all café staff on shift 5. Skeleton mode drops
+`add_two_consecutive_days_off_per_14`, `add_sunday_rest_constraints`, and
+`add_max_staffing_caps` — but opening hours is "never-relax" alongside legal rest periods.
+The constraint already guards against empty `cov_vars` per slot, so it stays feasible at
+minimum headcount.
+
+**Where:** `src/solver/scheduler.py` — `_add_hard_constraints()`.
+
+---
+
+### 36. Infeasibility hint: impossible days shown explicitly
+**Decision:** `_generate_infeasibility_hints()` checks each demand day for the pigeonhole
+condition: if `cafe_needed + production_needed > total_available_employees`, the hint names
+the date, roles, and counts with "Close this day or reduce staffing rules."
+
+**Why May 2026 is infeasible:** Only 3 employees available (Aina, Jose, Paula). Cruise days
+require café=3 + prod=1 = 4 workers. Impossible by pigeonhole. Fix: close the specific cruise
+days or reduce low-season staffing rules from café=3 to café=2.
+
+**Why June 2026 is infeasible:** Peak demand requires prod=2, but only Aina (role=both) is
+production-capable before June 20 (Ferran/Noel start June 20, Marta June 28). Fix: reduce
+mid-season production minimum to 1 for June 1–15.
+
+**Where:** `src/solver/scheduler.py` — `_generate_infeasibility_hints()`.
+
+---
+
+### 37. Part-time overtime fix: minimize_overtime uses contracted_hours per employee
+**Decision:** `minimize_overtime()` was using `_ADULT_NORMAL_WEEKLY_WORKED_MIN` (37.5h)
+as the target for ALL employees. Since the hard cap is also 37.5h, overtime was always 0
+for everyone — the function was a no-op.
+
+**Fix:** `target_weekly_worked = max(int(emp.contracted_hours * 60), max_shift_min)`.
+Part-time employees (15h/week = 900 min/week) are now penalised when scheduled beyond their
+contracted 2 shifts/week.
+
+**Scale:** weight=3 × overtime capped at 2 full shifts (900 min) = max 2700 pts penalty per
+week vs +5/shift net reward on quiet days. Strongly negative beyond target.
+
+**Result (August 2026):** Alicia/Kalle went from 108h (720% of target) to 57h (~86%).
+Full-timers unchanged at 86–104% of their monthly target.
+
+**Where:** `src/solver/soft_constraints.py` — `minimize_overtime()`.
+
+---
+
+### 38. distribute_hours_fairly fixed: per-shift count, not per-minute
+**Decision:** Was using `worked_minutes` as coefficients — a 1-shift imbalance (450 min) ×
+weight=5 = -2,250 penalty, overwhelming the +50 contracted_hours reward. Fixed to use shift
+COUNT (coefficient=1): max penalty = 5 × len(days) ≈ 155.
+
+**Where:** `src/solver/soft_constraints.py` — `distribute_hours_fairly()`.
+
+---
+
+### 39. Chat Apply: DB save returns bool, preserves is_fallback/fallback_notes
+**Decision:** `_save_schedule_to_db()` now returns `bool`; `_do_apply()` checks the return
+value, shows `st.error()` on failure, logs per-action changes, and preserves `is_fallback`
+and `fallback_notes` when creating the new `ScheduleRead`.
+
+**Where:** `src/ui/components/chat_panel.py`.
+
+---
+
+### 41. Production coverage in `add_opening_hours_coverage` — only when demand exists
+**Bug:** The solver was INFEASIBLE for May 2026 even with café_needed=1 and production_needed=0
+for all days, and even with 3 café-capable employees and only 14 open days (trivially solvable).
+
+**Root cause:** `add_opening_hours_coverage` in `constraints.py` added production coverage
+constraints (≥1 production employee covering each hourly slot with ≥2 covering shifts) for
+EVERY open day, regardless of `demand.production_needed`. In May 2026, Aina (role=`both`)
+is the only production-capable employee. The constraint forced her onto a production shift
+every single open day. Combined with `add_weekly_rest` (which limits each employee to ≤6
+working days per rolling 7-day open-day window), Aina was required to work every day AND
+rest at least 1 day per 7 days — an irreconcilable contradiction. This made every 7-day
+window of the entire month infeasible.
+
+**Why changing Aina to `role=cafe` fixed it:** Aina no longer had production shift variables,
+so the production coverage constraint had `cov_vars = []` and was skipped (via `if not cov_vars: continue`).
+
+**Fix 1:** In `add_opening_hours_coverage`, the production coverage section is now wrapped in
+`if dd.production_needed > 0:`. Production coverage is only enforced when the day actually
+has production demand. On days with production_needed=0, the constraint is skipped entirely.
+No change to café coverage (which is always enforced unconditionally).
+
+**Fix 2:** In `add_daily_staffing_requirements`, added a combined-capacity cap:
+`effective_prod_min = max(0, n_avail_today - effective_cafe_min)` prevents setting
+café+production minimums that collectively exceed total available employees (which would
+always be infeasible for a `both`-role employee who can only work one role per day).
+
+**Verified:** With override rules café=1, prod=0: solver now returns OPTIMAL (41 working
+assignments for 14 open days, 5 available employees, 0.13s). With default rules and the
+genuine May 17 conflict (good ship needs café=3 + prod=1, only 3 employees available): solver
+returns INFEASIBLE with an explicit human-readable diagnostic, and the fallback solver
+succeeds at Step C.
+
+**Where:** `src/solver/constraints.py` — `add_opening_hours_coverage()` and
+`add_daily_staffing_requirements()`.
+
+---
+
+### 42. Closed days and staffing rules — debugging aids added
+**Context:** The user believed closed days and edited staffing rules were being ignored
+because the solver still returned INFEASIBLE after closing 17/31 May days and lowering
+minimums to café=1, prod=0.
+
+**Actual situation:**
+1. Closed days WERE working — `generate_monthly_demand` correctly skipped them,
+   `ScheduleGenerator.__init__` filtered them from `self._days` and `self._demand_map`.
+2. Staffing rules WERE being read from DB via `load_staffing_rules_from_db()`.
+3. The REAL cause was bug #41 above (production coverage).
+
+**Aids added:**
+- `ScheduleGenerator.__init__`: logs closed days list + open day count at INFO level.
+- `ScheduleGenerator.build_model()`: logs distinct staffing minimums from the demand map.
+- `4_schedule.py`: shows an info banner (open days count, closed days count) above the
+  Generate button whenever any days are closed.
+- `1_settings.py`: after saving staffing rules, immediately re-queries the DB and displays
+  a "Saved values" readback block so the user can verify the save was applied.
+
+**Where:** `src/solver/scheduler.py`, `src/ui/pages/4_schedule.py`, `src/ui/pages/1_settings.py`.
+
+---
+
+### 40. Grid expand/collapse toggle on Schedule page
+**Decision:** "🔍 Expand" / "📅 Collapse" button toggles `st.session_state["grid_expanded"]`.
+When expanded, the normal grid is hidden and a full-width grid at height=900 is rendered
+BELOW both columns (using the full Streamlit container width).
+
+**Where:** `src/ui/pages/4_schedule.py`.
+
 ## Known limitations / future work
 
 - The solver timeout is 60 seconds per pass. For complex months (`add_two_consecutive_days_off_per_14` especially), it may return FEASIBLE (not OPTIMAL). This is acceptable.

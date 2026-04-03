@@ -74,7 +74,9 @@ Schedule_app/
 │   │   ├── establishment.py       # EstablishmentSettingsBase/Read/ORM
 │   │   ├── schedule.py            # ScheduleORM, AssignmentORM, ScheduleRead, AssignmentRead
 │   │   │                          #   ScheduleRead has: is_fallback (bool), fallback_notes (str|None JSON)
-│   │   └── daily_demand.py        # DailyDemandORM (stored demand snapshots)
+│   │   ├── daily_demand.py        # DailyDemandORM (stored demand snapshots)
+│   │   ├── staffing_rule.py       # StaffingRuleORM — editable café/production minimums per season+scenario
+│   │   └── closed_day.py          # ClosedDayORM — dates when shop is closed (solver skips these)
 │   ├── db/
 │   │   ├── database.py            # SQLAlchemy engine, Base, db_session context manager
 │   │   ├── migrations.py          # create_all_tables(), reset_all_tables(), run_safe_migrations()
@@ -106,10 +108,10 @@ Schedule_app/
 │   └── ui/
 │       ├── app.py                 # Entry point: DB init + welcome page
 │       ├── pages/
-│       │   ├── 1_settings.py      # Season configs, shift templates, Eidsdal settings
-│       │   ├── 2_employees.py     # Employee list, edit form, CSV upload
+│       │   ├── 1_settings.py      # Season configs, shift templates, staffing rules (editable), Eidsdal settings
+│       │   ├── 2_employees.py     # Employee list, edit form, CSV upload (tolerant parser with correction notes)
 │       │   ├── 3_cruise_ships.py  # Ship list, calendar view, CSV upload
-│       │   ├── 4_schedule.py      # Schedule generator + approval flow + fallback UI
+│       │   ├── 4_schedule.py      # Schedule generator + closed days calendar + approval flow + fallback UI
 │       │   ├── 5_schedule_editor.py  # Interactive pivot-table editor
 │       │   └── 6_export.py        # Download Excel/PDF, validation dashboard, heatmap
 │       └── components/
@@ -148,6 +150,12 @@ Fields: `id` (str, e.g. "1", "P1"), `role` (cafe/production), `label` (display n
 
 The solver always creates day-off placeholder assignments for available employees who aren't working, so the grid always shows every employee for every available day.
 
+### StaffingRule
+Fields: `id` (int, serial PK), `season` (str: "low"/"mid"/"peak"), `scenario` (str: e.g. "with_cruise"), `cafe_needed` (int), `production_needed` (int). Unique constraint on `(season, scenario)`. Seeded from `STAFFING_RULES` on first run if table is empty. Editable in Settings → Tab 3.
+
+### ClosedDay
+Fields: `id` (UUID PK), `date` (date, UNIQUE), `year` (int), `reason` (text, nullable). One row per closed date. The manager creates these via the calendar UI on the Schedule page. Closed days are skipped by `generate_monthly_demand()` and shown as grey 🔒 columns in the schedule grid and Excel export.
+
 `fallback_notes` JSON schema:
 ```json
 {
@@ -161,16 +169,23 @@ The solver always creates day-off placeholder assignments for available employee
 
 ## Demand engine
 
-**`generate_monthly_demand(year, month, ships) → list[DailyDemand]`**
+**`generate_monthly_demand(year, month, ships, closed_days=None, rules=None) → list[DailyDemand]`**
 
 For each calendar day in the month that falls within the operating season:
-1. Determine season (low/mid/peak) from date
-2. Look up ships arriving that day
-3. Calculate `effective_ship_impact` (Geiranger=1.0 per ship, Hellesylt=0.5)
-4. Apply `STAFFING_RULES[season][scenario]` to get `cafe_needed` and `production_needed`
-5. Extract required languages from `ship.extra_language` (split on comma, filter "english")
+1. Skip if date is in `closed_days` (no demand, no assignments)
+2. Determine season (low/mid/peak) from date
+3. Look up ships arriving that day
+4. Calculate `effective_ship_impact` (Geiranger=1.0 per ship, Hellesylt=0.5)
+5. Load staffing rules: if `rules` not provided, calls `load_staffing_rules_from_db()` which reads
+   from the `staffing_rules` DB table (falls back to hardcoded `STAFFING_RULES` if table empty)
+6. Apply rules to get `cafe_needed` and `production_needed`
+7. Extract required languages from `ship.extra_language` (split on comma, filter "english")
 
 **Staffing scenarios (simplified):** no_cruise, with_cruise, with_good_ship — each has different café/production counts per season.
+
+**Staffing rules DB:** The `staffing_rules` table is the live source of truth. It is seeded from
+`STAFFING_RULES` on first run. Editable in Settings → Tab 3. `load_staffing_rules_from_db()`
+uses lazy import to avoid circular imports between `seasonal_rules.py` and `database.py`.
 
 ---
 
@@ -227,6 +242,8 @@ When the normal solver returns INFEASIBLE, the UI shows diagnostics and a **"⚡
 - **Step C** — Reduce café/production minimums by 1 on **all days**
 - **Step D** — Same demand as Step C + `disable_both_preference=True` (flex employees assigned freely)
 - **Step E** — Absolute floor: café minimum = 1 (where demand existed), production minimum = 0
+- **Skeleton** — café ≥ 1 per open day, production = 0, drops 4 complex constraints (opening hours
+  coverage, 14-day paired rest, Sunday rest, staffing caps), uses `model.Minimize(sum_vars)` objective
 
 **Never relaxed in any fallback step:**
 - Opening hours coverage (≥1 in café per slot at all times)
@@ -242,14 +259,18 @@ When the normal solver returns INFEASIBLE, the UI shows diagnostics and a **"⚡
 
 `FallbackResult.notes_json()` serialises to JSON for storage in `ScheduleORM.fallback_notes`.
 
-`staffing_gaps_from_json()` and `relaxation_notes_from_json()` reconstruct from stored JSON (used when loading from DB after a session restart).
+`staffing_gaps_from_json()`, `relaxation_notes_from_json()`, and `is_skeleton_from_json()` reconstruct
+from stored JSON (used when loading from DB after a session restart).
+
+`FallbackResult.is_skeleton` property: `True` when `steps_applied == ["SKELETON"]`.
 
 **UI integration (`4_schedule.py`):**
 - After INFEASIBLE: diagnostics expander stays visible + fallback button appears
 - `_inf_info`, `_inf_demand`, `_inf_year`, `_inf_month` stored in session state
 - After fallback success: `ScheduleRead` has `is_fallback=True`, `fallback_notes=JSON`
-- Yellow bordered banner + collapsible staffing gaps expander shown whenever `schedule.is_fallback`
-- Same banner shown in `5_schedule_editor.py`
+- **Normal fallback:** yellow bordered banner + collapsible staffing gaps expander
+- **Skeleton fallback:** red `st.error` banner with 🚨 warning + auto-expanded gaps expander
+- Same banners shown in `5_schedule_editor.py`
 - Excel export (row 3): yellow warning note when `is_fallback`
 
 ---
@@ -291,6 +312,8 @@ Current migrations:
 - `establishment_settings.max_prod_per_day INTEGER NOT NULL DEFAULT 4`
 - `schedules.is_fallback BOOLEAN NOT NULL DEFAULT FALSE`
 - `schedules.fallback_notes TEXT`
+- `CREATE TABLE IF NOT EXISTS staffing_rules (id SERIAL PK, season TEXT, scenario TEXT, cafe_needed INT, production_needed INT, UNIQUE(season, scenario))`
+- `CREATE TABLE IF NOT EXISTS closed_days (id UUID PK, date DATE UNIQUE, year INT, reason TEXT NULL)`
 
 To reset the entire DB (destroys all data):
 ```bash
@@ -326,6 +349,6 @@ LLM_MAX_TOKENS=4096
 1. **Settings** — verify season dates and shift templates are seeded correctly
 2. **Employees** — upload employee CSV (one-time; re-upload to update)
 3. **Cruise Ships** — upload ship schedule CSV (from the port authority / Excel export)
-4. **Schedule** — select month, click Generate; if FEASIBLE → review and Save/Approve; if INFEASIBLE → view diagnostics and optionally generate best-effort
+4. **Schedule** — select month, optionally mark closed days (🔒 calendar UI above Generate), click Generate; if FEASIBLE → review and Save/Approve; if INFEASIBLE → view diagnostics and optionally generate best-effort (Steps B→C→D→E→Skeleton)
 5. **Schedule Editor** — fine-tune individual assignments in the pivot grid
 6. **Export** — download Excel (Vaktlista format) or PDF after approval

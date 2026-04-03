@@ -53,6 +53,39 @@ STAFFING_RULES: dict[Season, dict[str, dict[str, int]]] = {
 }
 
 
+def load_staffing_rules_from_db() -> dict:
+    """Load staffing rules from DB.  Falls back to hardcoded STAFFING_RULES if the
+    table is empty or unavailable (e.g. before first migration).
+
+    Returns the same nested structure as STAFFING_RULES:
+      {Season: {scenario_str: {"cafe": int, "production": int}}}
+    """
+    try:
+        from src.db.database import db_session
+        from src.models.staffing_rule import StaffingRuleORM
+        with db_session() as db:
+            rows = db.query(StaffingRuleORM).all()
+        if not rows:
+            return STAFFING_RULES
+        result: dict = {}
+        for r in rows:
+            try:
+                season = Season(r.season)
+            except ValueError:
+                continue
+            result.setdefault(season, {})[r.scenario] = {
+                "cafe": r.cafe_needed,
+                "production": r.production_needed,
+            }
+        # Fill any missing seasons/scenarios from defaults so the app never crashes
+        for s, scenarios in STAFFING_RULES.items():
+            for scenario, counts in scenarios.items():
+                result.setdefault(s, {}).setdefault(scenario, counts)
+        return result
+    except Exception:
+        return STAFFING_RULES
+
+
 def get_staffing_scenario(
     season: Season,
     effective_impact: float,

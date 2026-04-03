@@ -92,7 +92,8 @@ def _compute_total_hours(schedule, shift_templates) -> float:
     )
 
 
-def _save_schedule_to_db(schedule) -> None:
+def _save_schedule_to_db(schedule) -> bool:
+    """Persist the updated schedule to DB.  Returns True on success, False on failure."""
     try:
         from src.db.database import db_session
         from src.models.schedule import AssignmentORM, ScheduleORM
@@ -111,6 +112,8 @@ def _save_schedule_to_db(schedule) -> None:
                 status=schedule.status.value,
                 created_at=schedule.created_at,
                 modified_at=datetime.utcnow(),
+                is_fallback=getattr(schedule, "is_fallback", False),
+                fallback_notes=getattr(schedule, "fallback_notes", None),
             )
             db.add(orm)
             db.flush()
@@ -124,8 +127,10 @@ def _save_schedule_to_db(schedule) -> None:
                     is_day_off=a.is_day_off,
                     notes=a.notes,
                 ))
+        return True
     except Exception as e:
-        st.warning(f"Auto-save after LLM edit failed: {e}")
+        st.error(f"❌ Database save failed after LLM edit: {e}")
+        return False
 
 
 # ── Main render function ──────────────────────────────────────────────────────
@@ -407,7 +412,12 @@ def _do_apply(
     shift_templates,
     label: str = "Applied changes",
 ) -> None:
-    """Apply one or more actions, save to DB, reset to draft, show diff + toast."""
+    """Apply one or more actions, save to DB, reset to draft, show diff + toast.
+
+    On DB write failure: shows a red error, does NOT show green confirmation,
+    but still updates in-memory session state so the grid reflects the change
+    within the current session.
+    """
     from src.llm.advisor import apply_action
     from src.models.enums import ScheduleStatus
     from src.models.schedule import ScheduleRead
@@ -415,8 +425,21 @@ def _do_apply(
     hours_before = _compute_total_hours(schedule, shift_templates)
     current = schedule
     all_warnings: list[str] = []
+    change_log: list[str] = []
 
     for action in actions:
+        emp_name = action.get("employee", "?")
+        act_date = action.get("date")
+        date_str = act_date.strftime("%b %d") if hasattr(act_date, "strftime") else str(act_date)
+        old_a = next(
+            (a for a in current.assignments
+             if str(a.employee_id) == str(
+                 next((e.id for e in employees if e.name == emp_name), None)
+             ) and a.date == act_date),
+            None,
+        )
+        old_shift = (old_a.shift_id if old_a else "none")
+
         new_sched, warns = apply_action(action, current, employees, demand, shift_templates)
         new_sched = ScheduleRead(
             id=new_sched.id,
@@ -426,25 +449,40 @@ def _do_apply(
             created_at=new_sched.created_at,
             modified_at=datetime.utcnow(),
             assignments=new_sched.assignments,
+            is_fallback=getattr(new_sched, "is_fallback", False),
+            fallback_notes=getattr(new_sched, "fallback_notes", None),
         )
+        new_shift = action.get("shift") or ("off" if action["action"] in ("unassign", "day_off") else "?")
+        change_log.append(f"Updated: **{emp_name}** on {date_str}: `{old_shift}` → `{new_shift}`")
         current = new_sched
         all_warnings.extend(warns)
 
-    hours_after = _compute_total_hours(current, shift_templates)
-    _save_schedule_to_db(current)
-
+    # Always update in-memory state so the grid reflects the change immediately
     st.session_state["current_schedule"] = current
     st.session_state["editor_schedule"] = current
     if "advisor" in st.session_state:
         st.session_state.advisor.schedule = current
 
+    # Persist to DB — show error on failure but don't block the in-memory update
+    saved = _save_schedule_to_db(current)
+
+    hours_after = _compute_total_hours(current, shift_templates)
     diff = hours_after - hours_before
     diff_str = (
         f"  \nTotal hours: **{hours_before:.0f}h → {hours_after:.0f}h** (Δ{diff:+.0f}h)"
         if abs(diff) > 0.05
         else ""
     )
-    conf = f"✅ {label}.{diff_str}  \n_Schedule set back to draft — re-approve when ready._"
+
+    if saved:
+        save_note = "_Saved to database. Schedule set back to draft — re-approve when ready._"
+    else:
+        save_note = "_⚠️ In-memory only — database save failed (see error above). Use Save Draft to retry._"
+
+    change_lines = "\n".join(f"- {c}" for c in change_log)
+    conf = f"✅ {label}.{diff_str}  \n{save_note}"
+    if change_log:
+        conf += f"\n\n**Changes made:**\n{change_lines}"
     if all_warnings:
         conf += "\n\n⚠️ " + "  \n⚠️ ".join(all_warnings)
 
@@ -453,11 +491,14 @@ def _do_apply(
     # Flash banner for the calling page's schedule grid
     st.session_state["_apply_flash"] = label
 
-    # Toast notification — gives immediate top-of-page feedback
+    # Toast notification
     try:
-        st.toast("Change applied — schedule updated ✅", icon="✅")
+        if saved:
+            st.toast("Change applied and saved ✅", icon="✅")
+        else:
+            st.toast("Change applied (in-memory only — DB save failed)", icon="⚠️")
     except Exception:
-        pass  # st.toast not available in all Streamlit versions
+        pass
 
     st.rerun()
 

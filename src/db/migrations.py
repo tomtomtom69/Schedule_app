@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 # Import all ORM models so they register with Base.metadata before any operation.
 # IMPORTANT: every model file with an ORM class must be listed here.
-from src.models import employee, cruise_ship, shift_template, establishment, schedule, daily_demand  # noqa: F401
+from src.models import employee, cruise_ship, shift_template, establishment, schedule, daily_demand, staffing_rule, closed_day  # noqa: F401
 
 
 def create_all_tables() -> None:
@@ -34,6 +34,22 @@ def run_safe_migrations() -> None:
         # Fallback mode flag and relaxation report
         "ALTER TABLE schedules ADD COLUMN IF NOT EXISTS is_fallback BOOLEAN NOT NULL DEFAULT FALSE",
         "ALTER TABLE schedules ADD COLUMN IF NOT EXISTS fallback_notes TEXT",
+        # DB-editable staffing rules
+        """CREATE TABLE IF NOT EXISTS staffing_rules (
+            id SERIAL PRIMARY KEY,
+            season VARCHAR NOT NULL,
+            scenario VARCHAR NOT NULL,
+            cafe_needed INTEGER NOT NULL,
+            production_needed INTEGER NOT NULL,
+            CONSTRAINT uq_staffing_rule_season_scenario UNIQUE (season, scenario)
+        )""",
+        # Closed days (shop not open — solver skips these dates)
+        """CREATE TABLE IF NOT EXISTS closed_days (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            date DATE NOT NULL UNIQUE,
+            year INTEGER NOT NULL,
+            reason TEXT
+        )""",
     ]
     try:
         with engine.connect() as conn:

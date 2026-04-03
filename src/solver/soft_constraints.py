@@ -12,6 +12,10 @@ Variables = dict[tuple, cp_model.IntVar]  # (employee_id, date, shift_id) -> Boo
 
 WEIGHTS = {
     "language_coverage": 100,   # highest priority soft constraint
+    # Priority 4 waterfall: fill contracted hours (high weight — outweighs over-coverage)
+    # Full-time: +50 per shift up to weekly target (37.5h ÷ 7.5h = 5 shifts/week)
+    # Part-time: +25 per shift up to their contracted target
+    "contracted_hours": 50,
     # Section 4: staffing priority waterfall — per-assignment day-type rewards
     "good_ship_day": 60,        # reward each assignment on a good-ship day
     "cruise_day": 35,           # reward each assignment on a regular cruise day
@@ -23,6 +27,10 @@ WEIGHTS = {
     # Other soft constraints
     "eidsdal_grouping": 8,
     "employee_preferences": 5,
+    # fair_distribution: penalty per shift of spread between most- and least-worked
+    # employee (uses shift COUNT, not minutes — avoids catastrophic scale mismatch
+    # with contracted_hours reward).  Weight=5 per shift means max penalty ≈ 5×31=155,
+    # well below the contracted_hours reward of 50/shift.
     "fair_distribution": 5,
     "minimize_overtime": 3,
     "shift_variety": 2,         # small penalty for same shift on consecutive days
@@ -80,6 +88,12 @@ def add_soft_constraints(
     else:
         # Fallback if no demand info: flat full-time preference
         prefer_full_time(model, variables, employees, shifts, days, obj_vars, obj_coeffs)
+
+    # Priority 4: fill contracted hours for each employee up to their weekly target.
+    # Weight=50/shift (FT) and 25/shift (PT) — high enough to outweigh the
+    # over-coverage penalties (−3/−5 day-level) and the fair-distribution penalty
+    # (−5/shift).  This is the "waterfall" that ensures full-timers reach ~162h/month.
+    reward_contracted_hours(model, variables, employees, shifts, days, obj_vars, obj_coeffs)
 
     # Section 5: role priority — keep "both" employees on production.
     # Skipped in fallback mode so flex workers can freely fill café gaps.
@@ -142,6 +156,58 @@ def prefer_language_coverage(
             model.Add(sum(lang_vars) == 0).OnlyEnforceIf(covered.Not())
             obj_vars.append(covered)
             obj_coeffs.append(w)
+
+
+def reward_contracted_hours(
+    model: cp_model.CpModel,
+    variables: Variables,
+    employees: list[EmployeeRead],
+    shifts: list[ShiftTemplateRead],
+    days: list[date],
+    obj_vars: list,
+    obj_coeffs: list,
+) -> None:
+    """Priority 4 waterfall: high-weight reward per shift up to each employee's
+    contracted weekly hours target.
+
+    Full-time (37.5h/week ÷ 7.5h/shift = 5 shifts/week): +50 per shift.
+    Part-time (e.g. 15h/week ÷ 7.5 = 2 shifts/week): +25 per shift.
+    Zero reward beyond the weekly target — no incentive for overtime.
+
+    Weight (50) is chosen so that this constraint dominates over:
+    - over_coverage_t1 penalty (−3/day): net = +47 per shift
+    - fair_distribution penalty (−5/shift spread): net = +45 per shift
+    Both are still positive, so the solver will always fill contracted hours
+    before over-coverage or fairness penalties can deter it.
+    """
+    w = WEIGHTS["contracted_hours"]
+
+    for emp in employees:
+        # Derive weekly shift target from contracted_hours.
+        # Standard shift = 7.5h worked; full-time = 37.5h → 5 shifts.
+        target_per_week = max(1, round(emp.contracted_hours / 7.5))
+        weight = w if emp.employment_type == EmploymentType.full_time else w // 2
+
+        for week_key, week_days in _days_by_week(days).items():
+            emp_week_vars = [
+                variables[(emp.id, d, s.id)]
+                for d in week_days
+                for s in shifts
+                if (emp.id, d, s.id) in variables
+            ]
+            if not emp_week_vars:
+                continue
+
+            suffix = f"{emp.id}_{week_key[0]}w{week_key[1]}"
+            n_this_week = model.NewIntVar(0, len(emp_week_vars), f"nwk_{suffix}")
+            model.Add(n_this_week == sum(emp_week_vars))
+
+            # Cap reward at target: rewarded = min(n_this_week, target_per_week)
+            rewarded = model.NewIntVar(0, target_per_week, f"rwd_{suffix}")
+            model.AddMinEquality(rewarded, [n_this_week, model.NewConstant(target_per_week)])
+
+            obj_vars.append(rewarded)
+            obj_coeffs.append(weight)
 
 
 def prefer_high_demand_days(
@@ -341,18 +407,27 @@ def minimize_overtime(
     obj_vars: list,
     obj_coeffs: list,
 ) -> None:
-    """Penalise weekly worked hours above the contracted target (Section 8).
+    """Penalise weekly worked hours above the employee's contracted target.
 
-    Since the hard cap in add_weekly_hour_limits is already 37.5h for adults,
-    this soft constraint mainly serves as an extra nudge for part-time employees
-    to stay within their contracted hours.
+    Uses emp.contracted_hours as the per-week target so part-time employees
+    (e.g. 15h/week) are penalised when scheduled beyond their contracted 2
+    shifts/week, not just when they exceed the 37.5h hard cap (which they
+    can never reach anyway).
+
+    Penalty is applied in worked-minutes above target, capped at 2 full shifts
+    (900 min) to keep bounds manageable.  With weight=3 the max penalty per
+    week is 3×900=2700 pts — strong enough to deter over-scheduling part-timers
+    on quiet days where the net reward is only +5/shift.
     """
-    # Use worked_minutes (not raw template duration)
     shift_worked = {s.id: s.worked_minutes for s in shifts}
     w = WEIGHTS["minimize_overtime"]
+    max_shift_min = max(s.worked_minutes for s in shifts) if shifts else 450
 
     for emp in employees:
-        target_weekly_worked = _ADULT_NORMAL_WEEKLY_WORKED_MIN  # 37.5h for all
+        # Use the employee's own contracted weekly hours as the cap target.
+        # Full-time (37.5h) → same as the hard limit, so overtime ≈ 0.
+        # Part-time (e.g. 15h) → strongly penalises working beyond 2 shifts/week.
+        target_weekly_worked = max(int(emp.contracted_hours * 60), max_shift_min)
 
         for week_key, week_days in _days_by_week(days).items():
             wk_vars = []
@@ -366,14 +441,15 @@ def minimize_overtime(
                 continue
 
             suffix = f"{emp.id}_{week_key[0]}_{week_key[1]}"
-            # Max possible worked minutes this week
-            max_wk = target_weekly_worked + 120  # small buffer for CP-SAT bounds
+            max_wk = _ADULT_NORMAL_WEEKLY_WORKED_MIN  # hard cap — safe upper bound
             weekly_worked = model.NewIntVar(0, max_wk, f"wkm_{suffix}")
             model.Add(
                 weekly_worked == cp_model.LinearExpr.WeightedSum(wk_vars, wk_coeffs)
             )
 
-            overtime = model.NewIntVar(0, 120, f"ot_{suffix}")
+            # Cap overtime at 2 full shifts so CP-SAT bounds stay tight
+            ot_cap = 2 * max_shift_min
+            overtime = model.NewIntVar(0, ot_cap, f"ot_{suffix}")
             model.Add(overtime >= weekly_worked - target_weekly_worked)
             model.Add(overtime >= 0)
 
@@ -390,43 +466,44 @@ def distribute_hours_fairly(
     obj_vars: list,
     obj_coeffs: list,
 ) -> None:
-    """Minimise the spread between the most- and least-worked employee.
+    """Minimise the spread between the most- and least-worked employee (by shift count).
 
-    Creates total_hours IntVar per employee, then penalises (max - min) spread.
+    Uses shift COUNT (not worked minutes) so the penalty scale is compatible with
+    the contracted_hours reward (weight=50/shift).  Max penalty = 5 × len(days),
+    which is far below the contracted_hours reward total, so fairness never prevents
+    employees from reaching their contracted targets.
     """
     if len(employees) < 2:
         return
 
-    shift_worked = {s.id: s.worked_minutes for s in shifts}
     w = WEIGHTS["fair_distribution"]
-    max_total_minutes = len(days) * max(shift_worked.values(), default=0)
-    if max_total_minutes == 0:
+    max_shifts = len(days)  # upper bound on shifts any one employee can work
+    if max_shifts == 0:
         return
 
     emp_total_vars: list[cp_model.IntVar] = []
     for emp in employees:
-        emp_vars = []
-        emp_coeffs = []
-        for d in days:
-            for s in shifts:
-                if (emp.id, d, s.id) in variables:
-                    emp_vars.append(variables[(emp.id, d, s.id)])
-                    emp_coeffs.append(shift_worked[s.id])
+        emp_vars = [
+            variables[(emp.id, d, s.id)]
+            for d in days
+            for s in shifts
+            if (emp.id, d, s.id) in variables
+        ]
         if emp_vars:
-            total = model.NewIntVar(0, max_total_minutes, f"total_h_{emp.id}")
-            model.Add(total == cp_model.LinearExpr.WeightedSum(emp_vars, emp_coeffs))
+            total = model.NewIntVar(0, max_shifts, f"total_s_{emp.id}")
+            model.Add(total == sum(emp_vars))
             emp_total_vars.append(total)
 
     if len(emp_total_vars) < 2:
         return
 
-    max_h = model.NewIntVar(0, max_total_minutes, "max_hours")
-    min_h = model.NewIntVar(0, max_total_minutes, "min_hours")
-    model.AddMaxEquality(max_h, emp_total_vars)
-    model.AddMinEquality(min_h, emp_total_vars)
+    max_s = model.NewIntVar(0, max_shifts, "max_shifts_all")
+    min_s = model.NewIntVar(0, max_shifts, "min_shifts_all")
+    model.AddMaxEquality(max_s, emp_total_vars)
+    model.AddMinEquality(min_s, emp_total_vars)
 
-    spread = model.NewIntVar(0, max_total_minutes, "hours_spread")
-    model.Add(spread == max_h - min_h)
+    spread = model.NewIntVar(0, max_shifts, "shifts_spread")
+    model.Add(spread == max_s - min_s)
 
     obj_vars.append(spread)
     obj_coeffs.append(-w)

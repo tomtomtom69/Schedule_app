@@ -250,13 +250,26 @@ with tab_upload:
         **Required columns:**
         `name, languages, role_capability, employment_type, contracted_hours, housing, driving_licence, availability_start, availability_end`
 
-        **Optional column:** `date_of_birth` (YYYY-MM-DD) — required for employees under 18 to apply age-based constraints.
+        **Optional columns:** `date_of_birth` or `age` — required for employees under 18.
+
+        **Tolerant input — all of these are accepted:**
+        | Field | Accepted values |
+        |---|---|
+        | `role_capability` | `cafe` / `Cafe` / `café` / `Caf`, `production` / `Production` / `Manager Production`, `both` |
+        | `employment_type` | `full_time` / `full-time` / `Full-Time`, `part_time` / `part-time` / `Part-time` |
+        | `driving_licence` | `true`/`false`, `yes`/`no`, `1`/`0`, `TRUE`/`FALSE` |
+        | `housing` | `Geiranger` / `geiranger`, `Eidsdal` / `eidsdal` |
+        | `languages` | Comma **or** semicolon separated; any case; `english` auto-added if missing |
+        | `date_of_birth` | `YYYY-MM-DD`, `DD-MM-YYYY`, `DD.MM.YYYY`, `1 dec 2010`, `01 des 2010`, etc. |
+        | `age` | Integer age — converted to approximate birth year (Jan 1) |
+
+        Blank rows are skipped silently. Auto-corrections are shown after upload.
 
         **Example:**
         ```
         name,languages,role_capability,employment_type,contracted_hours,housing,driving_licence,availability_start,availability_end,date_of_birth
-        Aina,"english,spanish",both,full_time,37.5,eidsdal,true,2026-05-01,2026-10-15,
-        Lars,english,cafe,part_time,20.0,geiranger,false,2026-06-01,2026-08-31,2010-03-15
+        Aina,"english;spanish",Both,full-time,37.5,Eidsdal,yes,2026-05-01,2026-10-15,
+        Lars,English,Café,part_time,20.0,geiranger,1,2026-06-01,2026-08-31,15-03-2010
         ```
         """
     )
@@ -274,7 +287,7 @@ with tab_upload:
         else:
             # New file — clear any stale saved marker
             st.session_state.pop("_employees_saved_file", None)
-            records, errors = parse_employees_csv(uploaded)
+            records, errors, corrections = parse_employees_csv(uploaded)
 
             if errors:
                 st.error(f"{len(errors)} row(s) failed validation:")
@@ -284,6 +297,11 @@ with tab_upload:
             if records:
                 st.session_state["employees_unsaved"] = len(records)
                 st.success(f"{len(records)} employee(s) parsed successfully.")
+
+                if corrections:
+                    with st.expander(f"ℹ️ {len(corrections)} auto-correction(s) applied — click to review"):
+                        for note in corrections:
+                            st.caption(note)
 
                 # Year mismatch check against existing ship data
                 try:

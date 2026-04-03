@@ -50,6 +50,7 @@ def _employee_row_html(
     days: list[date],
     lookup: dict[tuple, str],
     eidsdal_ids: set,
+    closed_days: "frozenset[date] | set[date]" = frozenset(),
 ) -> str:
     is_eidsdal = emp.id in eidsdal_ids
     is_pt = emp.employment_type == "part_time"
@@ -68,6 +69,13 @@ def _employee_row_html(
     )
 
     for d in days:
+        if d in closed_days:
+            cells += (
+                f"<td style='background:{COLOR_CLOSED}; padding:2px 4px; text-align:center; "
+                f"border:1px solid #aaa; min-width:30px; font-size:9px; color:#666;'>—</td>"
+            )
+            continue
+
         is_available = emp.availability_start <= d <= emp.availability_end
         shift_id = lookup.get((emp.id, d)) if is_available else None
 
@@ -90,7 +98,12 @@ def _section_header_html(label: str, num_cols: int) -> str:
     )
 
 
-def _cruise_info_rows_html(days: list[date], demand: list[DailyDemand], num_cols: int) -> str:
+def _cruise_info_rows_html(
+    days: list[date],
+    demand: list[DailyDemand],
+    num_cols: int,
+    closed_days: "frozenset[date] | set[date]" = frozenset(),
+) -> str:
     demand_map = {d.date: d for d in demand}
     rows_html = _section_header_html("CRUISE INFO", num_cols)
 
@@ -101,6 +114,14 @@ def _cruise_info_rows_html(days: list[date], demand: list[DailyDemand], num_cols
             f"background:#C8E6FA; border:1px solid #ccc; font-size:11px;'>{lbl}</td>"
         )
         for d in days:
+            if d in closed_days:
+                cells += (
+                    f"<td style='background:{COLOR_CLOSED}; padding:2px 4px; text-align:center; "
+                    f"border:1px solid #aaa; font-size:9px; color:#666;'>"
+                    f"{'CLOSED' if lbl == 'Ships' else ''}</td>"
+                )
+                continue
+
             dd = demand_map.get(d)
             style = (
                 "background:#E8F4FD; padding:2px 4px; text-align:center; "
@@ -144,15 +165,25 @@ def _legend_html(shifts: list[ShiftTemplateRead]) -> str:
     return f"<table style='border-collapse:collapse; margin-top:2px;'>{rows}</table>"
 
 
+COLOR_CLOSED = "#CCCCCC"   # grey — shop closed, no staffing
+
+
 def build_schedule_html(
     schedule: ScheduleRead,
     employees: list[EmployeeRead],
     shifts: list[ShiftTemplateRead],
     demand: list[DailyDemand],
+    closed_days: "set[date] | frozenset[date] | None" = None,
 ) -> str:
-    """Build a full HTML representation of the schedule."""
-    days = sorted({d.date for d in demand})
-    if not days:
+    """Build a full HTML representation of the schedule.
+
+    closed_days: dates to render as grey 'CLOSED' columns (no staffing needed).
+    """
+    _closed = closed_days or frozenset()
+    demand_days = sorted({d.date for d in demand})
+    # Show all demand days + any closed days that fall in the same month range
+    all_days = sorted(set(demand_days) | set(_closed))
+    if not all_days:
         return "<p>No days in demand profile.</p>"
 
     lookup = _build_lookup(schedule)
@@ -168,18 +199,25 @@ def build_schedule_html(
         key=lambda e: (e.housing == "eidsdal", e.name),
     )
 
-    num_cols = len(days) + 1  # +1 for name column
+    num_cols = len(all_days) + 1  # +1 for name column
 
     # Header row
     th = "<th style='padding:4px 8px; text-align:left; background:#4A90D9; color:white; white-space:nowrap;'>Employee</th>"
-    for d in days:
-        is_weekend = d.weekday() >= 5
-        bg = "#2E6DB4" if is_weekend else "#4A90D9"
-        th += (
-            f"<th style='padding:3px 2px; text-align:center; background:{bg}; "
-            f"color:white; font-size:10px; min-width:28px; border:1px solid #3A7BC8;'>"
-            f"{d.strftime('%a')}<br>{d.day}</th>"
-        )
+    for d in all_days:
+        if d in _closed:
+            th += (
+                f"<th style='padding:3px 2px; text-align:center; background:#888888; "
+                f"color:white; font-size:10px; min-width:28px; border:1px solid #666;'>"
+                f"🔒<br>{d.day}</th>"
+            )
+        else:
+            is_weekend = d.weekday() >= 5
+            bg = "#2E6DB4" if is_weekend else "#4A90D9"
+            th += (
+                f"<th style='padding:3px 2px; text-align:center; background:{bg}; "
+                f"color:white; font-size:10px; min-width:28px; border:1px solid #3A7BC8;'>"
+                f"{d.strftime('%a')}<br>{d.day}</th>"
+            )
     header_row = f"<tr>{th}</tr>"
 
     # Build table body
@@ -187,13 +225,13 @@ def build_schedule_html(
     if prod_emps:
         tbody += _section_header_html("PRODUCTION", num_cols)
         for emp in prod_emps:
-            tbody += _employee_row_html(emp, days, lookup, eidsdal_ids)
+            tbody += _employee_row_html(emp, all_days, lookup, eidsdal_ids, _closed)
     if cafe_emps:
         tbody += _section_header_html("CAFÉ", num_cols)
         for emp in cafe_emps:
-            tbody += _employee_row_html(emp, days, lookup, eidsdal_ids)
+            tbody += _employee_row_html(emp, all_days, lookup, eidsdal_ids, _closed)
 
-    tbody += _cruise_info_rows_html(days, demand, num_cols)
+    tbody += _cruise_info_rows_html(all_days, demand, num_cols, _closed)
 
     table_style = (
         "border-collapse:collapse; font-family:'Segoe UI',monospace; "
@@ -242,8 +280,9 @@ def render_schedule_grid(
     shifts: list[ShiftTemplateRead],
     demand: list[DailyDemand],
     height: int = 600,
+    closed_days: "set[date] | frozenset[date] | None" = None,
 ) -> None:
     """Render the schedule grid in Streamlit."""
     import streamlit.components.v1 as components
-    html = build_schedule_html(schedule, employees, shifts, demand)
+    html = build_schedule_html(schedule, employees, shifts, demand, closed_days)
     components.html(html, height=height, scrolling=True)

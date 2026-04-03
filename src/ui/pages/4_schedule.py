@@ -16,7 +16,12 @@ from src.models.enums import ScheduleStatus
 from src.models.schedule import AssignmentORM, AssignmentRead, ScheduleORM, ScheduleRead
 from src.models.shift_template import ShiftTemplateORM, ShiftTemplateRead
 from src.solver import ScheduleGenerator, Violation, validate_schedule, run_fallback_solve
-from src.solver.fallback import relaxation_notes_from_json, staffing_gaps_from_json
+from src.solver.fallback import (
+    is_skeleton_from_json,
+    relaxation_notes_from_json,
+    staffing_gaps_from_json,
+)
+from src.models.closed_day import ClosedDayORM
 from src.ui.components.chat_panel import render_chat_panel
 from src.ui.components.schedule_grid import render_schedule_grid
 from src.ui.components.sidebar import render_shift_legend
@@ -77,6 +82,36 @@ def _stale_prev_month_warning(schedule: "ScheduleRead") -> str | None:
         return None
     except Exception:
         return None
+
+
+# ── Closed days helpers ───────────────────────────────────────────────────────
+
+def load_closed_days(year: int, month: int) -> set[date]:
+    """Load closed dates for the given month from DB."""
+    try:
+        _, last_day = calendar.monthrange(year, month)
+        with db_session() as db:
+            rows = db.query(ClosedDayORM).filter(
+                ClosedDayORM.year == year,
+                ClosedDayORM.date >= date(year, month, 1),
+                ClosedDayORM.date <= date(year, month, last_day),
+            ).all()
+        return {r.date for r in rows}
+    except Exception:
+        return set()
+
+
+def save_closed_days(year: int, month: int, closed: set[date]) -> None:
+    """Replace the closed-day set for year/month in DB."""
+    _, last_day = calendar.monthrange(year, month)
+    with db_session() as db:
+        db.query(ClosedDayORM).filter(
+            ClosedDayORM.year == year,
+            ClosedDayORM.date >= date(year, month, 1),
+            ClosedDayORM.date <= date(year, month, last_day),
+        ).delete(synchronize_session=False)
+        for d in closed:
+            db.add(ClosedDayORM(date=d, year=year))
 
 
 # ── Helper: load data from DB ─────────────────────────────────────────────────
@@ -244,6 +279,10 @@ def compute_weekly_hours(
     return totals
 
 
+# ── Session state init (must be before widgets) ───────────────────────────────
+if "grid_expanded" not in st.session_state:
+    st.session_state["grid_expanded"] = False
+
 # ── Layout: two columns (main + chat) ────────────────────────────────────────
 # Column ratio widens the chat panel when the user has toggled expanded mode
 _chat_expanded = st.session_state.get("chat_expanded", False)
@@ -315,6 +354,84 @@ with main_col:
             "Upload ship data on the Cruise Ships page — generating without ships may produce an empty schedule."
         )
 
+    # ── Closed Days calendar ──────────────────────────────────────────────────
+    # Initialise per-month session state key
+    _closed_key = f"closed_days_{sel_year}_{sel_month}"
+    if _closed_key not in st.session_state:
+        st.session_state[_closed_key] = load_closed_days(sel_year, sel_month)
+
+    with st.expander(
+        f"🔒 Closed Days  ({len(st.session_state[_closed_key])} selected)",
+        expanded=False,
+    ):
+        st.caption(
+            "Mark days when the café is closed. Closed days are skipped by the solver "
+            "and shown as grey columns in the schedule grid."
+        )
+        _, days_in_month_closed = calendar.monthrange(sel_year, sel_month)
+        # Build a checkbox grid week by week (Mon–Sun)
+        month_days = [date(sel_year, sel_month, d) for d in range(1, days_in_month_closed + 1)]
+        # Pad start of first week
+        first_weekday = month_days[0].weekday()  # 0=Mon
+        padded = [None] * first_weekday + month_days
+        # Pad end to full weeks
+        while len(padded) % 7:
+            padded.append(None)
+
+        day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        header_cols = st.columns(7)
+        for i, dn in enumerate(day_names):
+            header_cols[i].markdown(f"**{dn}**")
+
+        _pending_closed: set[date] = set()
+        for week_start in range(0, len(padded), 7):
+            week = padded[week_start:week_start + 7]
+            cols = st.columns(7)
+            for i, d in enumerate(week):
+                if d is None:
+                    cols[i].write("")
+                else:
+                    checked = cols[i].checkbox(
+                        str(d.day),
+                        value=(d in st.session_state[_closed_key]),
+                        key=f"closed_{d.isoformat()}",
+                    )
+                    if checked:
+                        _pending_closed.add(d)
+
+        if st.button("💾 Save Closed Days", key="save_closed_btn"):
+            save_closed_days(sel_year, sel_month, _pending_closed)
+            st.session_state[_closed_key] = _pending_closed
+            st.success(f"Saved {len(_pending_closed)} closed day(s) for {SEASON_MONTHS[sel_month]} {sel_year}.")
+            st.rerun()
+
+    _closed_days: set[date] = st.session_state[_closed_key]
+
+    # ── Open / closed day summary ─────────────────────────────────────────────
+    _, _days_in_month_total = calendar.monthrange(sel_year, sel_month)
+    _season_open_days = []
+    try:
+        from src.demand.seasonal_rules import get_season
+        for _day_n in range(1, _days_in_month_total + 1):
+            _d = date(sel_year, sel_month, _day_n)
+            if _d in _closed_days:
+                continue
+            try:
+                get_season(_d)
+                _season_open_days.append(_d)
+            except ValueError:
+                pass
+    except Exception:
+        pass
+
+    _n_closed = len(_closed_days)
+    _n_open = len(_season_open_days)
+    if _n_closed > 0:
+        st.info(
+            f"**{SEASON_MONTHS[sel_month]} {sel_year}:** "
+            f"{_n_closed} closed day(s), **{_n_open} open day(s)** for scheduling."
+        )
+
     with col_gen:
         st.write("")  # spacing
         generate_clicked = st.button("🔄 Generate Schedule", type="primary", use_container_width=True)
@@ -357,7 +474,7 @@ with main_col:
             st.session_state.pop(_k, None)
         with st.spinner(f"Generating {SEASON_MONTHS[sel_month]} {sel_year} schedule (up to 60s)…"):
             try:
-                demand = generate_monthly_demand(sel_year, sel_month, ships)
+                demand = generate_monthly_demand(sel_year, sel_month, ships, closed_days=_closed_days)
                 if not demand:
                     st.error("No demand generated — check that the selected month is within the operating season (May–October).")
                 else:
@@ -459,14 +576,15 @@ with main_col:
                         "⛔ **Fallback solver exhausted all relaxation steps** — no workable "
                         "schedule found. This usually means there are not enough employees to "
                         "cover opening hours (≥1 in café at all times) while respecting rest "
-                        "constraints. Add more employees or adjust their availability dates."
+                        "constraints. Options: add more employees, adjust availability dates, "
+                        "or mark some low-demand days as **Closed** using the calendar above."
                     )
 
     # ── Load saved ────────────────────────────────────────────────────────────
     if load_clicked:
         saved = load_saved_schedule(sel_year, sel_month)
         if saved:
-            demand = generate_monthly_demand(sel_year, sel_month, ships)
+            demand = generate_monthly_demand(sel_year, sel_month, ships, closed_days=_closed_days)
             st.session_state["current_schedule"] = saved
             st.session_state["current_demand"] = demand
             st.session_state["schedule_year"] = sel_year
@@ -508,16 +626,32 @@ with main_col:
             # Fallback banner: shown when schedule was generated in fallback mode
             if getattr(schedule, "is_fallback", False):
                 _fb_notes = relaxation_notes_from_json(schedule.fallback_notes or "")
-                with st.container(border=True):
-                    st.warning(
-                        "⚠️ **Best-effort schedule** — this schedule was generated with "
-                        "relaxed constraints because the normal solver could not find a "
-                        "valid solution with the current number of available employees."
+                _is_skeleton = is_skeleton_from_json(schedule.fallback_notes)
+
+                if _is_skeleton:
+                    st.error(
+                        "🚨 **SKELETON SCHEDULE** — This is an absolute minimum schedule. "
+                        "Production staffing has been set to zero and several scheduling "
+                        "constraints have been dropped. **This schedule is not suitable for "
+                        "normal operations.** Add more staff or mark busy days as closed."
                     )
-                    if _fb_notes:
-                        st.markdown("**Constraints that were relaxed:**")
-                        for _note in _fb_notes:
-                            st.markdown(f"- {_note}")
+                    st.caption(
+                        "Skeleton mode dropped: 14-day paired rest · "
+                        "Sunday rest requirements · staffing caps  |  "
+                        "Opening hours coverage: still enforced"
+                    )
+                else:
+                    with st.container(border=True):
+                        st.warning(
+                            "⚠️ **Best-effort schedule** — this schedule was generated with "
+                            "relaxed constraints because the normal solver could not find a "
+                            "valid solution with the current number of available employees."
+                        )
+                        if _fb_notes:
+                            st.markdown("**Constraints that were relaxed:**")
+                            for _note in _fb_notes:
+                                st.markdown(f"- {_note}")
+
                 # Staffing gaps — try live result first, fall back to stored JSON
                 _fb_result = st.session_state.get("_fallback_result")
                 _gaps = _fb_result.staffing_gaps if _fb_result else staffing_gaps_from_json(schedule.fallback_notes or "")
@@ -525,7 +659,7 @@ with main_col:
                     with st.expander(
                         f"📋 Staffing Gaps — {len(_gaps)} day(s) below normal requirements "
                         "(focus hiring or manual adjustments here)",
-                        expanded=True,
+                        expanded=_is_skeleton,
                     ):
                         for _gap in _gaps:
                             st.write(f"🔴 {_gap.description()}")
@@ -603,9 +737,21 @@ with main_col:
             )
 
             # ── Schedule Grid ─────────────────────────────────────────────────
-            st.subheader(f"📅 {SEASON_MONTHS[sel_month]} {sel_year} — Schedule Grid")
+            _grid_exp = st.session_state.get("grid_expanded", False)
+            _grid_hdr, _grid_btn = st.columns([5, 1])
+            _grid_hdr.subheader(f"📅 {SEASON_MONTHS[sel_month]} {sel_year} — Schedule Grid")
+            if _grid_btn.button(
+                "📅 Collapse" if _grid_exp else "🔍 Expand",
+                key="grid_expand_btn",
+                use_container_width=True,
+            ):
+                st.session_state["grid_expanded"] = not _grid_exp
+                st.rerun()
 
-            render_schedule_grid(schedule, employees, shifts, demand_list, height=600)
+            if not _grid_exp:
+                render_schedule_grid(schedule, employees, shifts, demand_list, height=600, closed_days=_closed_days)
+            else:
+                st.info("⬇️ Full-width schedule grid displayed below — collapse to return to split view.")
 
             # ── Edit Assignment ───────────────────────────────────────────────
             with st.expander("✏️ Edit Assignment"):
@@ -765,3 +911,25 @@ with chat_col:
         demand=st.session_state.get("current_demand"),
         shift_templates=shifts if "shifts" in locals() else None,
     )
+
+# ── Full-width schedule grid (expanded mode) ──────────────────────────────────
+if st.session_state.get("grid_expanded"):
+    _fw_schedule = st.session_state.get("current_schedule")
+    _fw_demand = st.session_state.get("current_demand", [])
+    _fw_employees = employees if "employees" in locals() else []
+    _fw_shifts = shifts if "shifts" in locals() else []
+    _fw_closed = st.session_state.get(
+        f"closed_days_{st.session_state.get('schedule_year', sel_year)}_{st.session_state.get('schedule_month', sel_month)}",
+        set(),
+    )
+    if _fw_schedule and _fw_demand and _fw_employees and _fw_shifts:
+        st.divider()
+        _fw_hdr, _fw_btn = st.columns([5, 1])
+        _fw_hdr.subheader(
+            f"📅 {SEASON_MONTHS.get(st.session_state.get('schedule_month', sel_month), '')} "
+            f"{st.session_state.get('schedule_year', sel_year)} — Schedule Grid (Full Width)"
+        )
+        if _fw_btn.button("📅 Collapse", key="collapse_grid_fw", use_container_width=True):
+            st.session_state["grid_expanded"] = False
+            st.rerun()
+        render_schedule_grid(_fw_schedule, _fw_employees, _fw_shifts, _fw_demand, height=900, closed_days=_fw_closed)

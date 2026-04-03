@@ -11,6 +11,7 @@ from src.demand.seasonal_rules import (
     Season,
     get_season,
     get_staffing_scenario,
+    load_staffing_rules_from_db,
 )
 from src.models.cruise_ship import CruiseShipRead
 from src.models.enums import Port
@@ -49,6 +50,7 @@ def calculate_daily_demand(
     d: date,
     ships_on_date: list[CruiseShipRead],
     season: Season,
+    rules: dict | None = None,
 ) -> DailyDemand:
     """For a single day, calculate staffing needs.
 
@@ -72,9 +74,11 @@ def calculate_daily_demand(
     is_saturday = d.weekday() == 5  # 0=Mon … 5=Sat, 6=Sun
     scenario = get_staffing_scenario(season, effective_impact, has_good_ship, is_saturday)
 
-    rules = STAFFING_RULES[season][scenario]
-    production_needed = rules["production"]
-    cafe_needed = rules["cafe"]
+    active_rules = rules if rules is not None else STAFFING_RULES
+    season_rules = active_rules.get(season, STAFFING_RULES[season])
+    scenario_rules = season_rules.get(scenario, STAFFING_RULES[season].get(scenario, {"cafe": 1, "production": 0}))
+    production_needed = scenario_rules["production"]
+    cafe_needed = scenario_rules["cafe"]
 
     # Section 9: On quiet Sundays/Mondays with no cruise, allow reduced staffing.
     # Sunday=6, Monday=0 in Python's weekday() system.
@@ -104,25 +108,38 @@ def generate_monthly_demand(
     year: int,
     month: int,
     ships: list[CruiseShipRead],
+    closed_days: "set[date] | None" = None,
+    rules: dict | None = None,
 ) -> list[DailyDemand]:
     """Generate demand profile for every day of the month.
 
     Returns one DailyDemand per day that falls within the operating season
     (May 1 – Oct 15). Days outside the season are silently skipped.
-    Ships are filtered to those matching each day's date.
+    Closed days (shop not open) are also skipped — they produce no demand.
+
+    Args:
+        closed_days: set of date objects to skip entirely (shop closed).
+        rules: staffing rules dict; if None, loaded from DB (falling back to
+               hardcoded STAFFING_RULES if DB is empty).
     """
+    _closed = closed_days or set()
+    # Load rules from DB if not provided
+    active_rules = rules if rules is not None else load_staffing_rules_from_db()
+
     _, days_in_month = calendar.monthrange(year, month)
     demands: list[DailyDemand] = []
 
     for day in range(1, days_in_month + 1):
         d = date(year, month, day)
+        if d in _closed:
+            continue  # shop closed — no demand, no schedule for this day
         try:
             season = get_season(d)
         except ValueError:
             continue  # outside operating season
 
         ships_today = [s for s in ships if s.date == d]
-        demand = calculate_daily_demand(d, ships_today, season)
+        demand = calculate_daily_demand(d, ships_today, season, active_rules)
         demands.append(demand)
 
     return demands

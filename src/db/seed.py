@@ -2,8 +2,10 @@ import logging
 from datetime import date, time
 
 from src.db.database import db_session
+from src.demand.seasonal_rules import STAFFING_RULES
 from src.models.establishment import EstablishmentSettingsORM
 from src.models.shift_template import ShiftTemplateORM
+from src.models.staffing_rule import StaffingRuleORM
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +91,27 @@ def seed_season_settings() -> None:
         logger.info("Seeded %d season configurations.", len(DEFAULT_SEASONS))
 
 
+def seed_staffing_rules() -> None:
+    """Seed staffing rules from STAFFING_RULES if the table is empty."""
+    with db_session() as db:
+        count = db.query(StaffingRuleORM).count()
+        if count > 0:
+            logger.info("Staffing rules already seeded (%d rows), skipping.", count)
+            return
+        n = 0
+        for season, scenarios in STAFFING_RULES.items():
+            for scenario, counts in scenarios.items():
+                db.add(StaffingRuleORM(
+                    season=season.value,
+                    scenario=scenario,
+                    cafe_needed=counts["cafe"],
+                    production_needed=counts["production"],
+                ))
+                n += 1
+        logger.info("Seeded %d staffing rules.", n)
+
+
 def seed_defaults() -> None:
     seed_shift_templates()
     seed_season_settings()
+    seed_staffing_rules()

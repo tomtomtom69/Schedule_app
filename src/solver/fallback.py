@@ -52,9 +52,13 @@ class StaffingGap:
 class FallbackResult:
     """Outcome of a successful fallback solve."""
     schedule: ScheduleRead
-    steps_applied: list[str]       # e.g. ["C"] or ["C", "D"]
+    steps_applied: list[str]       # e.g. ["C"] or ["C", "D"] or ["SKELETON"]
     relaxation_notes: list[str]    # human-readable bullet points for the UI banner
     staffing_gaps: list[StaffingGap]
+
+    @property
+    def is_skeleton(self) -> bool:
+        return self.steps_applied == ["SKELETON"]
 
     def notes_json(self) -> str:
         """Serialise to JSON for storage in ScheduleORM.fallback_notes."""
@@ -115,11 +119,15 @@ def _try_solve(
     shifts: list[ShiftTemplateRead],
     settings=None,
     disable_both_preference: bool = False,
+    skeleton_mode: bool = False,
 ) -> tuple[ScheduleRead | None, object]:
     """Build and solve one CP-SAT model.  Returns (schedule_or_None, solve_info)."""
     from src.solver.scheduler import ScheduleGenerator
     gen = ScheduleGenerator(employees, demand, shifts, settings)
-    gen.build_model(disable_both_preference=disable_both_preference)
+    gen.build_model(
+        disable_both_preference=disable_both_preference,
+        skeleton_mode=skeleton_mode,
+    )
     result = gen.solve()
     return result, gen.solve_info
 
@@ -273,7 +281,38 @@ def run_fallback_solve(
             original_demand=demand, employees=employees, shifts=shifts,
         )
 
-    logger.error("Fallback solver exhausted all steps (B→C→D→E) — model remains INFEASIBLE")
+    # ── Skeleton mode: bare legal minimum — café ≥ 1, production = 0 ─────────
+    # Drops complex constraints (opening hours coverage, 14-day paired rest,
+    # Sunday rest, staffing caps) and uses a "minimise total assignments"
+    # objective so employees get as much rest as possible.
+    demand_skel = _relax_demand(demand, absolute_cafe_floor=1, absolute_prod_value=0)
+    logger.info(
+        "Fallback Skeleton mode: café ≥ 1 per open day (opening hours enforced), "
+        "production = 0, 14-day/Sunday/cap constraints dropped, maximise-assignments objective"
+    )
+    result, _ = _try_solve(
+        employees, demand_skel, shifts, settings,
+        disable_both_preference=True,
+        skeleton_mode=True,
+    )
+    if result is not None:
+        return _build_result(
+            result, steps_applied=["SKELETON"],
+            relaxation_notes=base_notes + [
+                "SKELETON MODE: absolute minimum staffing applied",
+                "Café minimum: 1 per open day — opening hours coverage still enforced "
+                "(≥1 café employee per hourly slot within operating hours)",
+                "Production minimum: 0 on all days",
+                "Dropped constraints: 14-day paired rest, Sunday rest, staffing caps",
+                "Objective: maximise working assignments within skeleton constraints",
+            ],
+            original_demand=demand, employees=employees, shifts=shifts,
+        )
+
+    logger.error(
+        "Skeleton solver INFEASIBLE — even with bare legal minimums no schedule is possible. "
+        "Not enough employees to cover opening hours while respecting rest periods."
+    )
     return None
 
 
@@ -300,3 +339,13 @@ def relaxation_notes_from_json(fallback_notes_json: str) -> list[str]:
         return json.loads(fallback_notes_json).get("notes", [])
     except Exception:
         return []
+
+
+def is_skeleton_from_json(fallback_notes_json: str | None) -> bool:
+    """Return True if the stored fallback_notes indicates a skeleton schedule."""
+    if not fallback_notes_json:
+        return False
+    try:
+        return json.loads(fallback_notes_json).get("steps", []) == ["SKELETON"]
+    except Exception:
+        return False

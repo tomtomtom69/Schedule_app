@@ -30,6 +30,7 @@ COLORS = {
     "cruise_row":        "E8F4FD",  # very light blue
     "title_bg":          "4A90D9",  # dark blue — title rows
     "legend_header":     "EEEEEE",  # grey
+    "closed":            "CCCCCC",  # grey — shop closed
 }
 
 _THIN = Side(style="thin", color="AAAAAA")
@@ -77,12 +78,14 @@ def export_schedule_to_excel(
     employees: list[EmployeeRead],
     demand: list[DailyDemand],
     shift_templates: list[ShiftTemplateRead],
+    closed_days: "set[date] | frozenset[date] | None" = None,
 ) -> bytes:
     """Generate Excel workbook. Returns bytes ready for download."""
     month = schedule.month
     year = schedule.year
     month_name = calendar.month_name[month]
     _, days_in_month = calendar.monthrange(year, month)
+    _closed = closed_days or frozenset()
 
     demand_map = {d.date: d for d in demand}
     assign_map: dict[tuple, str] = {
@@ -160,6 +163,7 @@ def export_schedule_to_excel(
             prod_emps, cafe_emps,
             demand_map, assign_map, shift_map, shift_templates,
             write_legend=(not legend_written),
+            closed_days=_closed,
         )
         legend_written = True
         current_row += 2  # gap between halves
@@ -192,6 +196,7 @@ def _write_half(
     shift_map: dict,
     shift_templates: list[ShiftTemplateRead],
     write_legend: bool,
+    closed_days: "frozenset[date] | set[date]" = frozenset(),
 ) -> int:
     """Write one half of the month. Returns the last row written."""
     row = start_row
@@ -203,41 +208,53 @@ def _write_half(
     ws.cell(row=row, column=1, value="").fill = _fill(COLORS["header_day"])
     for i, d in enumerate(days, start=2):
         cell = ws.cell(row=row, column=i)
-        is_weekend = d.weekday() >= 5
-        _apply(cell,
-               value=d.strftime("%a"),
-               fill=_fill("C0D0F0" if is_weekend else COLORS["header_day"]),
-               font=_font(bold=True, size=9),
-               align=_align(),
-               border=_THIN_BORDER)
+        if d in closed_days:
+            _apply(cell, value="🔒",
+                   fill=_fill(COLORS["closed"]),
+                   font=_font(bold=True, size=9, color="666666"),
+                   align=_align(), border=_THIN_BORDER)
+        else:
+            is_weekend = d.weekday() >= 5
+            _apply(cell,
+                   value=d.strftime("%a"),
+                   fill=_fill("C0D0F0" if is_weekend else COLORS["header_day"]),
+                   font=_font(bold=True, size=9),
+                   align=_align(),
+                   border=_THIN_BORDER)
     row += 1
 
     # Row: day numbers
     ws.cell(row=row, column=1, value="").fill = _fill(COLORS["header_day"])
     for i, d in enumerate(days, start=2):
         cell = ws.cell(row=row, column=i)
-        is_weekend = d.weekday() >= 5
-        _apply(cell,
-               value=d.day,
-               fill=_fill("C0D0F0" if is_weekend else COLORS["header_day"]),
-               font=_font(bold=True, size=9),
-               align=_align(),
-               border=_THIN_BORDER)
+        if d in closed_days:
+            _apply(cell, value=d.day,
+                   fill=_fill(COLORS["closed"]),
+                   font=_font(bold=True, size=9, color="666666"),
+                   align=_align(), border=_THIN_BORDER)
+        else:
+            is_weekend = d.weekday() >= 5
+            _apply(cell,
+                   value=d.day,
+                   fill=_fill("C0D0F0" if is_weekend else COLORS["header_day"]),
+                   font=_font(bold=True, size=9),
+                   align=_align(),
+                   border=_THIN_BORDER)
     row += 1
 
     # ── PRODUCTION section ────────────────────────────────────────────────────
     row = _write_section_header(ws, row, "PRODUCTION", num_day_cols, COLORS["prod_header"])
     for emp in prod_emps:
-        row = _write_employee_row(ws, row, emp, days, assign_map, shift_map)
+        row = _write_employee_row(ws, row, emp, days, assign_map, shift_map, closed_days)
 
     # ── CAFÉ section ──────────────────────────────────────────────────────────
     row = _write_section_header(ws, row, "CAFÉ", num_day_cols, COLORS["cafe_header"])
     for emp in cafe_emps:
-        row = _write_employee_row(ws, row, emp, days, assign_map, shift_map)
+        row = _write_employee_row(ws, row, emp, days, assign_map, shift_map, closed_days)
 
     # ── Cruise info section ───────────────────────────────────────────────────
     row += 1
-    row = _write_cruise_rows(ws, row, days, demand_map, num_day_cols)
+    row = _write_cruise_rows(ws, row, days, demand_map, num_day_cols, closed_days)
 
     # ── Shift legend (right side, starting from half block top) ──────────────
     if write_legend:
@@ -266,6 +283,7 @@ def _write_employee_row(
     days: list[date],
     assign_map: dict,
     shift_map: dict,
+    closed_days: "frozenset[date] | set[date]" = frozenset(),
 ) -> int:
     _h = emp.housing.value if hasattr(emp.housing, 'value') else str(emp.housing)
     _t = emp.employment_type.value if hasattr(emp.employment_type, 'value') else str(emp.employment_type)
@@ -283,6 +301,14 @@ def _write_employee_row(
 
     for i, d in enumerate(days, start=2):
         cell = ws.cell(row=row, column=i)
+
+        if d in closed_days:
+            _apply(cell, value="",
+                   fill=_fill(COLORS["closed"]),
+                   border=_THIN_BORDER,
+                   align=_align())
+            continue
+
         is_avail = emp.availability_start <= d <= emp.availability_end
 
         if not is_avail:
@@ -305,7 +331,14 @@ def _write_employee_row(
     return row + 1
 
 
-def _write_cruise_rows(ws, row: int, days: list[date], demand_map: dict, num_day_cols: int) -> int:
+def _write_cruise_rows(
+    ws,
+    row: int,
+    days: list[date],
+    demand_map: dict,
+    num_day_cols: int,
+    closed_days: "frozenset[date] | set[date]" = frozenset(),
+) -> int:
     labels = ["Ships", "Port", "Count", "Arrival"]
     fields = ["ships", "port", "count", "arrival"]
 
@@ -342,6 +375,14 @@ def _write_cruise_rows(ws, row: int, days: list[date], demand_map: dict, num_day
                border=_THIN_BORDER)
         for i, d in enumerate(days, start=2):
             cell = ws.cell(row=row, column=i)
+            if d in closed_days:
+                _apply(cell,
+                       value="CLOSED" if field == "ships" else "",
+                       fill=_fill(COLORS["closed"]),
+                       font=_font(size=8, color="666666"),
+                       align=_align(),
+                       border=_THIN_BORDER)
+                continue
             data = day_data.get(d, {})
             value = data.get(field, "")
             _apply(cell,
