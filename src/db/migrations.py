@@ -34,6 +34,8 @@ def run_safe_migrations() -> None:
         # Fallback mode flag and relaxation report
         "ALTER TABLE schedules ADD COLUMN IF NOT EXISTS is_fallback BOOLEAN NOT NULL DEFAULT FALSE",
         "ALTER TABLE schedules ADD COLUMN IF NOT EXISTS fallback_notes TEXT",
+        # Archive versioning
+        "ALTER TABLE schedules ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1",
         # DB-editable staffing rules
         """CREATE TABLE IF NOT EXISTS staffing_rules (
             id SERIAL PRIMARY KEY,

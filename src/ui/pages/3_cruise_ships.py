@@ -211,44 +211,131 @@ with tab_ships:
                 st.dataframe(preview, use_container_width=True, hide_index=True)
 
                 st.divider()
-                with st.container(border=True):
-                    st.markdown(
-                        f"### 🚢 Save {len(records)} Ship Arrival(s) to Database",
-                        help="Upserts by (ship_name, date) — existing records will be updated.",
+
+                # Check how many ships already exist in the DB
+                try:
+                    with db_session() as db:
+                        _existing_count = db.query(CruiseShipORM).count()
+                        _duplicate_count = sum(
+                            1 for r in records
+                            if db.query(CruiseShipORM).filter_by(
+                                ship_name=r.ship_name, date=r.date,
+                                arrival_time=r.arrival_time,
+                            ).first() is not None
+                        )
+                except Exception:
+                    _existing_count = 0
+                    _duplicate_count = 0
+
+                if _duplicate_count > 0:
+                    st.info(
+                        f"ℹ️ **{_duplicate_count} of {len(records)} arrivals** already exist in the database "
+                        "(matched on ship name + date + arrival time)."
                     )
-                    if st.button(
-                        f"✅ Save {len(records)} Ship Arrival(s) to Database",
-                        type="primary",
-                        use_container_width=True,
-                        key="save_ships_btn",
-                    ):
-                        try:
-                            with db_session() as db:
-                                for record in records:
-                                    data = record.model_dump()
-                                    existing = (
-                                        db.query(CruiseShipORM)
-                                        .filter_by(ship_name=record.ship_name, date=record.date)
-                                        .first()
+
+                with st.container(border=True):
+                    if _existing_count > 0:
+                        st.markdown("### Choose how to save these arrivals")
+                        st.caption(
+                            f"Database currently has **{_existing_count}** ship arrival record(s). "
+                            "Append adds only new ships; Replace All clears everything first."
+                        )
+                        _btn_col1, _btn_col2 = st.columns(2)
+
+                        # ── Append ────────────────────────────────────────────
+                        if _btn_col1.button(
+                            f"➕ Append — add {len(records) - _duplicate_count} new arrival(s)",
+                            use_container_width=True,
+                            key="append_ships_btn",
+                        ):
+                            try:
+                                _added = 0
+                                with db_session() as db:
+                                    for record in records:
+                                        _dup = db.query(CruiseShipORM).filter_by(
+                                            ship_name=record.ship_name,
+                                            date=record.date,
+                                            arrival_time=record.arrival_time,
+                                        ).first()
+                                        if _dup is None:
+                                            db.add(CruiseShipORM(**record.model_dump()))
+                                            _added += 1
+                                st.session_state["_ships_saved_file"] = uploaded_ships.name
+                                st.session_state["_ships_save_count"] = _added
+                                st.session_state.pop("ships_unsaved", None)
+                                st.components.v1.html(
+                                    "<script>window.parent.onbeforeunload = null;</script>",
+                                    height=0,
+                                )
+                                st.success(f"✅ **{_added} new arrival(s) appended.** ({_duplicate_count} duplicates skipped)")
+                                st.balloons()
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Append failed: {e}")
+
+                        # ── Replace All ───────────────────────────────────────
+                        if "_replace_ships_confirm" not in st.session_state:
+                            if _btn_col2.button(
+                                "🗑️ Replace All — delete existing & import fresh",
+                                use_container_width=True,
+                                key="replace_ships_btn",
+                            ):
+                                st.session_state["_replace_ships_confirm"] = True
+                                st.rerun()
+                        else:
+                            st.warning(
+                                f"⚠️ This will **replace all {_existing_count} existing** cruise ship "
+                                f"records with the **{len(records)} new ones** from this file. Continue?"
+                            )
+                            _c1, _c2 = st.columns(2)
+                            if _c1.button("✅ Yes, Replace All", type="primary", use_container_width=True, key="confirm_replace_btn"):
+                                try:
+                                    with db_session() as db:
+                                        db.query(CruiseShipORM).delete()
+                                        db.flush()
+                                        for record in records:
+                                            db.add(CruiseShipORM(**record.model_dump()))
+                                    st.session_state["_ships_saved_file"] = uploaded_ships.name
+                                    st.session_state["_ships_save_count"] = len(records)
+                                    st.session_state.pop("ships_unsaved", None)
+                                    st.session_state.pop("_replace_ships_confirm", None)
+                                    st.components.v1.html(
+                                        "<script>window.parent.onbeforeunload = null;</script>",
+                                        height=0,
                                     )
-                                    if existing:
-                                        for k, v in data.items():
-                                            setattr(existing, k, v)
-                                    else:
-                                        db.add(CruiseShipORM(**data))
-                            st.session_state["_ships_saved_file"] = uploaded_ships.name
-                            st.session_state["_ships_save_count"] = len(records)
-                            st.session_state.pop("ships_unsaved", None)
-                            st.components.v1.html(
-                                "<script>window.parent.onbeforeunload = null;</script>",
-                                height=0,
-                            )
-                            st.success(
-                                f"✅ **{len(records)} ship arrival(s) saved successfully!**  \n"
-                                "The Ship List tab now shows the updated schedule."
-                            )
-                            st.balloons()
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Save failed: {e}")
+                                    st.success(f"✅ **Replaced: {len(records)} arrival(s) imported.**")
+                                    st.balloons()
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Replace failed: {e}")
+                            if _c2.button("Cancel", use_container_width=True, key="cancel_replace_btn"):
+                                st.session_state.pop("_replace_ships_confirm", None)
+                                st.rerun()
+                    else:
+                        # No existing records — just a plain save
+                        if st.button(
+                            f"✅ Save {len(records)} Ship Arrival(s) to Database",
+                            type="primary",
+                            use_container_width=True,
+                            key="save_ships_btn",
+                        ):
+                            try:
+                                with db_session() as db:
+                                    for record in records:
+                                        db.add(CruiseShipORM(**record.model_dump()))
+                                st.session_state["_ships_saved_file"] = uploaded_ships.name
+                                st.session_state["_ships_save_count"] = len(records)
+                                st.session_state.pop("ships_unsaved", None)
+                                st.components.v1.html(
+                                    "<script>window.parent.onbeforeunload = null;</script>",
+                                    height=0,
+                                )
+                                st.success(
+                                    f"✅ **{len(records)} ship arrival(s) saved successfully!**  \n"
+                                    "The Ship List tab now shows the updated schedule."
+                                )
+                                st.balloons()
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Save failed: {e}")
 

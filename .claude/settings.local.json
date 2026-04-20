@@ -5,7 +5,9 @@
       "Bash(docker exec:*)",
       "Bash(python -c \":*)",
       "Bash(docker ps:*)",
-      "Bash(grep -v \"^$\")"
+      "Bash(grep -v \"^$\")",
+      "Bash(docker cp *)",
+      "Bash(cmd *)"
     ]
   }
 }

@@ -159,25 +159,33 @@ def _load_saved_schedule(year: int, month: int) -> ScheduleRead | None:
         return None
 
 
-def _save_schedule(schedule: ScheduleRead) -> bool:
+def _save_schedule(schedule: ScheduleRead, as_approved: bool = False) -> bool:
+    """Save schedule to DB. Updates by ID if exists; inserts otherwise.
+    If as_approved=False and current status is approved, downgrades to draft.
+    """
     try:
+        target_status = ScheduleStatus.approved if as_approved else ScheduleStatus.draft
         with db_session() as db:
-            existing = db.query(ScheduleORM).filter_by(
-                year=schedule.year, month=schedule.month
-            ).first()
+            existing = db.query(ScheduleORM).filter_by(id=schedule.id).first()
             if existing:
-                db.delete(existing)
+                existing.status = target_status.value
+                existing.modified_at = datetime.utcnow()
+                existing.is_fallback = getattr(schedule, "is_fallback", False)
+                existing.fallback_notes = getattr(schedule, "fallback_notes", None)
+                db.query(AssignmentORM).filter_by(schedule_id=schedule.id).delete()
                 db.flush()
-            orm = ScheduleORM(
-                id=schedule.id, month=schedule.month, year=schedule.year,
-                status=schedule.status.value,
-                created_at=schedule.created_at,
-                modified_at=datetime.utcnow(),
-                is_fallback=getattr(schedule, "is_fallback", False),
-                fallback_notes=getattr(schedule, "fallback_notes", None),
-            )
-            db.add(orm)
-            db.flush()
+            else:
+                orm = ScheduleORM(
+                    id=schedule.id, month=schedule.month, year=schedule.year,
+                    status=target_status.value,
+                    version=getattr(schedule, "version", 1),
+                    created_at=schedule.created_at,
+                    modified_at=datetime.utcnow(),
+                    is_fallback=getattr(schedule, "is_fallback", False),
+                    fallback_notes=getattr(schedule, "fallback_notes", None),
+                )
+                db.add(orm)
+                db.flush()
             for a in schedule.assignments:
                 db.add(AssignmentORM(
                     id=a.id, schedule_id=schedule.id,
@@ -316,7 +324,15 @@ with main_col:
                 for _gap in _gaps:
                     st.write(f"🔴 {_gap.description()}")
 
-    st.subheader(f"Editing: {SEASON_MONTHS[schedule.month]} {schedule.year}  — Status: {schedule.status.value.upper()}")
+    _badge_icon = {"approved": "🟢", "draft": "🟡", "archived": "⬛"}.get(
+        schedule.status.value, "🔵"
+    )
+    _ver_num = getattr(schedule, "version", 1)
+    st.markdown(
+        f"**{_badge_icon} {schedule.status.value.upper()}** &nbsp;·&nbsp; "
+        f"Version {_ver_num}"
+    )
+    st.subheader(f"Editing: {SEASON_MONTHS[schedule.month]} {schedule.year}")
 
     # ── Build pivot DataFrame ─────────────────────────────────────────────────
     days = sorted({d.date for d in demand})
@@ -394,55 +410,68 @@ with main_col:
         height=min(50 + len(sorted_emps) * 35, 600),
     )
 
-    # ── Action buttons ────────────────────────────────────────────────────────
-    act1, act2, act3, act4 = st.columns(4)
-
-    apply_clicked = act1.button("✅ Apply Changes", type="primary", use_container_width=True)
-    save_clicked = act2.button("💾 Save Draft", use_container_width=True)
-    approve_clicked = act3.button("🏁 Approve", use_container_width=True)
-    validate_clicked = act4.button("🔍 Validate", use_container_width=True)
-
-    if apply_clicked:
-        # Convert edited_df back to assignments
-        new_assignments: list[AssignmentRead] = []
-        for _, row in edited_df.iterrows():
-            emp_name = row["Employee"]
-            emp = emp_by_name.get(emp_name)
-            if not emp:
+    # ── Auto-apply: always sync edited_df to in-memory schedule ─────────────
+    # Cell edits in the data_editor are applied immediately to session state.
+    # No "Apply Changes" button needed — Save Draft / Approve persist to DB.
+    _new_assignments: list[AssignmentRead] = []
+    for _, _row in edited_df.iterrows():
+        _emp_name = _row["Employee"]
+        _emp = emp_by_name.get(_emp_name)
+        if not _emp:
+            continue
+        for _d in days:
+            _key = str(_d)
+            _val = _row.get(_key, "")
+            if _val == "—" or _val is None or _val == "":
                 continue
-            for d in days:
-                key = str(d)
-                val = row.get(key, "")
-                if val == "—" or val is None or val == "":
-                    continue  # unavailable or removed
-                is_off = (val == "off")
-                # Preserve existing assignment ID if present
-                existing_a = assign_map.get((emp.id, d))
-                a_id = existing_a.id if existing_a else uuid.uuid4()
-                new_assignments.append(AssignmentRead(
-                    id=a_id,
-                    schedule_id=schedule.id,
-                    employee_id=emp.id,
-                    date=d,
-                    shift_id=val,
-                    is_day_off=is_off,
-                    notes=existing_a.notes if existing_a else None,
-                ))
+            _is_off = (_val == "off")
+            _existing_a = assign_map.get((_emp.id, _d))
+            _a_id = _existing_a.id if _existing_a else uuid.uuid4()
+            _new_assignments.append(AssignmentRead(
+                id=_a_id,
+                schedule_id=schedule.id,
+                employee_id=_emp.id,
+                date=_d,
+                shift_id=_val,
+                is_day_off=_is_off,
+                notes=_existing_a.notes if _existing_a else None,
+            ))
+    _live_schedule = ScheduleRead(
+        id=schedule.id, month=schedule.month, year=schedule.year,
+        status=schedule.status, version=getattr(schedule, "version", 1),
+        created_at=schedule.created_at, modified_at=schedule.modified_at,
+        assignments=_new_assignments,
+        is_fallback=getattr(schedule, "is_fallback", False),
+        fallback_notes=getattr(schedule, "fallback_notes", None),
+    )
+    st.session_state["editor_schedule"] = _live_schedule
+    st.session_state["current_schedule"] = _live_schedule
+    schedule = _live_schedule  # use latest for button actions below
 
-        updated = ScheduleRead(
-            id=schedule.id, month=schedule.month, year=schedule.year,
-            status=schedule.status, created_at=schedule.created_at,
-            modified_at=datetime.utcnow(),
-            assignments=new_assignments,
-        )
-        st.session_state["editor_schedule"] = updated
-        st.session_state["current_schedule"] = updated  # sync with generator page
-        st.success(f"Applied — {len(new_assignments)} assignments.")
-        st.rerun()
+    # ── Action buttons: Validate | Save Draft | Approve & Finalize ───────────
+    st.caption("Changes in the grid above are applied to memory instantly. Use the buttons below to persist or validate.")
+    act1, act2, act3 = st.columns(3)
+
+    validate_clicked = act1.button("🔍 Validate", use_container_width=True)
+    save_clicked = act2.button("💾 Save Draft", use_container_width=True, type="primary")
+    approve_clicked = act3.button("🏁 Approve & Finalize", use_container_width=True)
 
     if save_clicked:
-        if _save_schedule(schedule):
-            st.success("Saved as draft.")
+        if _save_schedule(schedule, as_approved=False):
+            _saved = ScheduleRead(
+                id=schedule.id, month=schedule.month, year=schedule.year,
+                status=ScheduleStatus.draft,
+                version=getattr(schedule, "version", 1),
+                created_at=schedule.created_at, modified_at=datetime.utcnow(),
+                assignments=schedule.assignments,
+                is_fallback=getattr(schedule, "is_fallback", False),
+                fallback_notes=getattr(schedule, "fallback_notes", None),
+            )
+            st.session_state["editor_schedule"] = _saved
+            st.session_state["current_schedule"] = _saved
+            st.success(
+                "💾 Saved as draft. Return to the **Schedule** tab to approve when ready."
+            )
             _next = _next_month_name_if_exists(schedule.year, schedule.month)
             if _next:
                 curr_name = f"{SEASON_MONTHS[schedule.month]} {schedule.year}"
@@ -453,33 +482,31 @@ with main_col:
                 )
 
     if approve_clicked:
-        if _save_schedule(schedule):
-            try:
-                with db_session() as db:
-                    orm = db.query(ScheduleORM).filter_by(id=schedule.id).first()
-                    if orm:
-                        orm.status = ScheduleStatus.approved.value
-                        orm.modified_at = datetime.utcnow()
-                approved = ScheduleRead(
-                    id=schedule.id, month=schedule.month, year=schedule.year,
-                    status=ScheduleStatus.approved,
-                    created_at=schedule.created_at, modified_at=datetime.utcnow(),
-                    assignments=schedule.assignments,
+        if _save_schedule(schedule, as_approved=True):
+            _approved = ScheduleRead(
+                id=schedule.id, month=schedule.month, year=schedule.year,
+                status=ScheduleStatus.approved,
+                version=getattr(schedule, "version", 1),
+                created_at=schedule.created_at, modified_at=datetime.utcnow(),
+                assignments=schedule.assignments,
+                is_fallback=getattr(schedule, "is_fallback", False),
+                fallback_notes=getattr(schedule, "fallback_notes", None),
+            )
+            st.session_state["editor_schedule"] = _approved
+            st.session_state["current_schedule"] = _approved
+            st.success(
+                "✅ Schedule approved and finalized. "
+                "This version will be used for cross-month calculations."
+            )
+            _next = _next_month_name_if_exists(schedule.year, schedule.month)
+            if _next:
+                curr_name = f"{SEASON_MONTHS[schedule.month]} {schedule.year}"
+                st.session_state["_cross_month_warn_editor"] = (
+                    f"⚠️ You have modified the **{curr_name}** schedule. "
+                    f"The **{_next}** schedule was generated based on the previous "
+                    f"version — consider regenerating **{_next}** to ensure consistency."
                 )
-                st.session_state["editor_schedule"] = approved
-                st.session_state["current_schedule"] = approved
-                st.success("Schedule approved! ✅")
-                _next = _next_month_name_if_exists(schedule.year, schedule.month)
-                if _next:
-                    curr_name = f"{SEASON_MONTHS[schedule.month]} {schedule.year}"
-                    st.session_state["_cross_month_warn_editor"] = (
-                        f"⚠️ You have modified the **{curr_name}** schedule. "
-                        f"The **{_next}** schedule was generated based on the previous "
-                        f"version — consider regenerating **{_next}** to ensure consistency."
-                    )
-                st.rerun()
-            except Exception as e:
-                st.error(f"Approve failed: {e}")
+            st.rerun()
 
     # ── Validation panel ──────────────────────────────────────────────────────
     if validate_clicked or st.session_state.get("editor_show_violations"):

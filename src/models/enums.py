@@ -43,3 +43,4 @@ class ShiftRole(str, Enum):
 class ScheduleStatus(str, Enum):
     draft = "draft"
     approved = "approved"
+    archived = "archived"

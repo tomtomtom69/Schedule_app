@@ -38,6 +38,7 @@ class ScheduleBase(BaseModel):
     month: int
     year: int
     status: ScheduleStatus = ScheduleStatus.draft
+    version: int = 1
 
     @field_validator("month")
     @classmethod
@@ -79,6 +80,7 @@ class ScheduleORM(Base):
     month = Column(Integer, nullable=False)
     year = Column(Integer, nullable=False)
     status = Column(String, nullable=False, default=ScheduleStatus.draft.value)
+    version = Column(Integer, nullable=False, default=1)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     modified_at = Column(DateTime, nullable=True)
     is_fallback = Column(Boolean, nullable=False, default=False)

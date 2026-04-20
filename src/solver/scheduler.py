@@ -451,12 +451,24 @@ class ScheduleGenerator:
                 prev_year -= 1
 
             with db_session() as db:
+                # Prefer the approved version; fall back to latest non-archived draft
                 orm = (
                     db.query(ScheduleORM)
-                    .filter_by(year=prev_year, month=prev_month)
-                    .order_by(ScheduleORM.created_at.desc())
+                    .filter_by(year=prev_year, month=prev_month, status="approved")
+                    .order_by(ScheduleORM.version.desc())
                     .first()
                 )
+                if orm is None:
+                    orm = (
+                        db.query(ScheduleORM)
+                        .filter(
+                            ScheduleORM.year == prev_year,
+                            ScheduleORM.month == prev_month,
+                            ScheduleORM.status != "archived",
+                        )
+                        .order_by(ScheduleORM.version.desc())
+                        .first()
+                    )
                 if not orm:
                     logger.info(
                         "No saved schedule for %d-%02d — cross-month carry-in assumed 0 for all employees.",

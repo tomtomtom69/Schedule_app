@@ -36,23 +36,30 @@ SEASON_MONTHS = {5: "May", 6: "June", 7: "July", 8: "August", 9: "September", 10
 # ── Cross-month consistency helpers ──────────────────────────────────────────
 
 def _next_month_name_if_exists(year: int, month: int) -> str | None:
-    """Return 'June 2026' if a saved schedule for month+1 exists in DB, else None."""
+    """Return 'June 2026' if a non-archived schedule for month+1 exists in DB, else None."""
     try:
         next_m = month % 12 + 1
         next_y = year + (1 if month == 12 else 0)
         if next_m not in SEASON_MONTHS:
             return None
         with db_session() as db:
-            exists = db.query(ScheduleORM).filter_by(year=next_y, month=next_m).first()
+            exists = (
+                db.query(ScheduleORM)
+                .filter(
+                    ScheduleORM.year == next_y,
+                    ScheduleORM.month == next_m,
+                    ScheduleORM.status != ScheduleStatus.archived.value,
+                )
+                .first()
+            )
             return f"{SEASON_MONTHS[next_m]} {next_y}" if exists else None
     except Exception:
         return None
 
 
 def _stale_prev_month_warning(schedule: "ScheduleRead") -> str | None:
-    """Return a warning string if the previous month was saved *after* this schedule
-    was created (meaning this schedule may not reflect the latest prev-month data).
-    Returns None if everything is in sync or no previous schedule exists.
+    """Return a warning string if the previous month's APPROVED schedule was modified
+    after this schedule was created. Uses approved version for cross-month accuracy.
     """
     try:
         prev_m = schedule.month - 1
@@ -63,12 +70,24 @@ def _stale_prev_month_warning(schedule: "ScheduleRead") -> str | None:
         if prev_m not in SEASON_MONTHS:
             return None
         with db_session() as db:
+            # Use approved version for cross-month check; fall back to latest non-archived
             prev_orm = (
                 db.query(ScheduleORM)
-                .filter_by(year=prev_y, month=prev_m)
-                .order_by(ScheduleORM.modified_at.desc())
+                .filter_by(year=prev_y, month=prev_m, status=ScheduleStatus.approved.value)
+                .order_by(ScheduleORM.version.desc())
                 .first()
             )
+            if prev_orm is None:
+                prev_orm = (
+                    db.query(ScheduleORM)
+                    .filter(
+                        ScheduleORM.year == prev_y,
+                        ScheduleORM.month == prev_m,
+                        ScheduleORM.status != ScheduleStatus.archived.value,
+                    )
+                    .order_by(ScheduleORM.version.desc())
+                    .first()
+                )
             if prev_orm is None or prev_orm.modified_at is None:
                 return None
             if prev_orm.modified_at > schedule.created_at:
@@ -166,66 +185,134 @@ def load_ships_for_month(year: int, month: int) -> list[CruiseShipRead]:
         ]
 
 
+def _orm_to_schedule_read(orm: ScheduleORM) -> ScheduleRead:
+    assignments = [
+        AssignmentRead(
+            id=a.id, schedule_id=a.schedule_id,
+            employee_id=a.employee_id, date=a.date,
+            shift_id=a.shift_id, is_day_off=a.is_day_off,
+            notes=a.notes,
+        )
+        for a in orm.assignments
+    ]
+    return ScheduleRead(
+        id=orm.id, month=orm.month, year=orm.year,
+        status=ScheduleStatus(orm.status),
+        version=getattr(orm, "version", 1),
+        created_at=orm.created_at,
+        modified_at=orm.modified_at,
+        assignments=assignments,
+        is_fallback=getattr(orm, "is_fallback", False),
+        fallback_notes=getattr(orm, "fallback_notes", None),
+    )
+
+
 def load_saved_schedule(year: int, month: int) -> ScheduleRead | None:
-    """Load the most recent saved schedule for year/month from DB."""
+    """Load the latest non-archived schedule for year/month."""
     try:
         with db_session() as db:
             orm = (
                 db.query(ScheduleORM)
-                .filter_by(year=year, month=month)
-                .order_by(ScheduleORM.created_at.desc())
+                .filter(
+                    ScheduleORM.year == year,
+                    ScheduleORM.month == month,
+                    ScheduleORM.status != ScheduleStatus.archived.value,
+                )
+                .order_by(ScheduleORM.version.desc())
                 .first()
             )
-            if orm is None:
-                return None
-
-            assignments = [
-                AssignmentRead(
-                    id=a.id, schedule_id=a.schedule_id,
-                    employee_id=a.employee_id, date=a.date,
-                    shift_id=a.shift_id, is_day_off=a.is_day_off,
-                    notes=a.notes,
-                )
-                for a in orm.assignments
-            ]
-            return ScheduleRead(
-                id=orm.id, month=orm.month, year=orm.year,
-                status=ScheduleStatus(orm.status),
-                created_at=orm.created_at,
-                modified_at=orm.modified_at,
-                assignments=assignments,
-                is_fallback=getattr(orm, "is_fallback", False),
-                fallback_notes=getattr(orm, "fallback_notes", None),
-            )
+            return _orm_to_schedule_read(orm) if orm else None
     except Exception:
         return None
 
 
-def save_schedule_to_db(schedule: ScheduleRead) -> bool:
-    """Persist a ScheduleRead to the database."""
+def load_schedule_by_id(schedule_id: uuid.UUID) -> ScheduleRead | None:
+    """Load a specific schedule by ID."""
     try:
         with db_session() as db:
-            # Remove any existing draft for this month
-            existing = db.query(ScheduleORM).filter_by(
-                year=schedule.year, month=schedule.month,
-            ).first()
-            if existing:
-                db.delete(existing)
-                db.flush()
+            orm = db.query(ScheduleORM).filter_by(id=schedule_id).first()
+            return _orm_to_schedule_read(orm) if orm else None
+    except Exception:
+        return None
 
-            orm = ScheduleORM(
-                id=schedule.id,
-                month=schedule.month,
-                year=schedule.year,
-                status=schedule.status.value,
-                created_at=schedule.created_at,
-                modified_at=datetime.utcnow(),
-                is_fallback=getattr(schedule, "is_fallback", False),
-                fallback_notes=getattr(schedule, "fallback_notes", None),
+
+def load_all_version_meta(year: int, month: int) -> list[dict]:
+    """Return lightweight version metadata (no assignments) for all versions of a month."""
+    try:
+        with db_session() as db:
+            rows = (
+                db.query(
+                    ScheduleORM.id, ScheduleORM.version, ScheduleORM.status,
+                    ScheduleORM.created_at, ScheduleORM.modified_at,
+                )
+                .filter_by(year=year, month=month)
+                .order_by(ScheduleORM.version.desc())
+                .all()
             )
-            db.add(orm)
-            db.flush()
+            return [
+                {
+                    "id": str(r.id),
+                    "version": r.version,
+                    "status": r.status,
+                    "created_at": r.created_at,
+                    "modified_at": r.modified_at,
+                }
+                for r in rows
+            ]
+    except Exception:
+        return []
 
+
+def archive_existing_schedules(year: int, month: int) -> int:
+    """Set all non-archived schedules for (year, month) to archived.
+    Returns the next version number to use.
+    """
+    try:
+        with db_session() as db:
+            rows = (
+                db.query(ScheduleORM)
+                .filter_by(year=year, month=month)
+                .all()
+            )
+            max_ver = 0
+            for r in rows:
+                max_ver = max(max_ver, getattr(r, "version", 1))
+                if r.status != ScheduleStatus.archived.value:
+                    r.status = ScheduleStatus.archived.value
+                    r.modified_at = datetime.utcnow()
+        return max_ver + 1
+    except Exception:
+        return 1
+
+
+def save_schedule_to_db(schedule: ScheduleRead) -> bool:
+    """Persist a ScheduleRead to the database.
+    Updates the existing record by ID if it already exists; otherwise inserts.
+    """
+    try:
+        with db_session() as db:
+            existing = db.query(ScheduleORM).filter_by(id=schedule.id).first()
+            if existing:
+                existing.status = schedule.status.value
+                existing.modified_at = datetime.utcnow()
+                existing.is_fallback = getattr(schedule, "is_fallback", False)
+                existing.fallback_notes = getattr(schedule, "fallback_notes", None)
+                db.query(AssignmentORM).filter_by(schedule_id=schedule.id).delete()
+                db.flush()
+            else:
+                orm = ScheduleORM(
+                    id=schedule.id,
+                    month=schedule.month,
+                    year=schedule.year,
+                    status=schedule.status.value,
+                    version=getattr(schedule, "version", 1),
+                    created_at=schedule.created_at,
+                    modified_at=datetime.utcnow(),
+                    is_fallback=getattr(schedule, "is_fallback", False),
+                    fallback_notes=getattr(schedule, "fallback_notes", None),
+                )
+                db.add(orm)
+                db.flush()
             for a in schedule.assignments:
                 db.add(AssignmentORM(
                     id=a.id,
@@ -256,6 +343,49 @@ def approve_schedule_in_db(schedule_id: uuid.UUID) -> bool:
     except Exception as e:
         st.error(f"Approve failed: {e}")
         return False
+
+
+def restore_archived_schedule(schedule: ScheduleRead) -> ScheduleRead | None:
+    """Copy an archived schedule as a new draft with the next version number."""
+    try:
+        next_ver = archive_existing_schedules.__wrapped__ if False else None  # unused
+        with db_session() as db:
+            from sqlalchemy import func
+            max_ver = (
+                db.query(func.max(ScheduleORM.version))
+                .filter_by(year=schedule.year, month=schedule.month)
+                .scalar()
+            ) or 0
+        new_id = uuid.uuid4()
+        new_assignments = [
+            AssignmentRead(
+                id=uuid.uuid4(),
+                schedule_id=new_id,
+                employee_id=a.employee_id,
+                date=a.date,
+                shift_id=a.shift_id,
+                is_day_off=a.is_day_off,
+                notes=a.notes,
+            )
+            for a in schedule.assignments
+        ]
+        new_schedule = ScheduleRead(
+            id=new_id,
+            month=schedule.month,
+            year=schedule.year,
+            status=ScheduleStatus.draft,
+            version=max_ver + 1,
+            created_at=datetime.utcnow(),
+            assignments=new_assignments,
+            is_fallback=schedule.is_fallback,
+            fallback_notes=schedule.fallback_notes,
+        )
+        if save_schedule_to_db(new_schedule):
+            return new_schedule
+        return None
+    except Exception as e:
+        st.error(f"Restore failed: {e}")
+        return None
 
 
 # ── Helper: weekly hours per employee ────────────────────────────────────────
@@ -304,7 +434,7 @@ with main_col:
 
     # ── Month/Year selector ───────────────────────────────────────────────────
     st.subheader("Select Month")
-    col_year, col_month, col_gen, col_load = st.columns([1, 1, 1, 1])
+    col_year, col_month, col_gen, col_load = st.columns([1, 1, 1.2, 1])
 
     with col_year:
         sel_year = st.selectbox("Year", options=[2026, 2027], index=0, key="sched_year")
@@ -434,10 +564,65 @@ with main_col:
 
     with col_gen:
         st.write("")  # spacing
-        generate_clicked = st.button("🔄 Generate Schedule", type="primary", use_container_width=True)
+        generate_clicked = st.button("🔄 Generate New Schedule", type="primary", use_container_width=True)
     with col_load:
         st.write("")
         load_clicked = st.button("📂 Load Saved", use_container_width=True)
+
+    # ── Version selector ──────────────────────────────────────────────────────
+    _all_versions = load_all_version_meta(sel_year, sel_month)
+    if _all_versions:
+        _ver_labels = []
+        for _v in _all_versions:
+            _dt = (_v["modified_at"] or _v["created_at"])
+            _dt_str = _dt.strftime("%b %d") if _dt else "?"
+            _ver_labels.append(
+                f"v{_v['version']} — {_v['status'].upper()} ({_dt_str})"
+            )
+        _ver_ids = [_v["id"] for _v in _all_versions]
+
+        _cur_sched = st.session_state.get("current_schedule")
+        _default_idx = 0
+        if _cur_sched and _cur_sched.year == sel_year and _cur_sched.month == sel_month:
+            try:
+                _default_idx = _ver_ids.index(str(_cur_sched.id))
+            except ValueError:
+                _default_idx = 0
+
+        _ver_key = f"_ver_sel_{sel_year}_{sel_month}"
+        if len(_all_versions) > 1:
+            _sel_ver_label = st.selectbox(
+                "Version", _ver_labels, index=_default_idx, key=_ver_key,
+                help="Select which version of this month's schedule to view.",
+            )
+            _sel_ver_idx = _ver_labels.index(_sel_ver_label)
+        else:
+            _sel_ver_idx = 0
+            _sel_ver_status = _all_versions[0]["status"].upper()
+            _badge = {"APPROVED": "🟢", "DRAFT": "🟡", "ARCHIVED": "⬛"}.get(_sel_ver_status, "🔵")
+            st.caption(f"**{_badge} {_ver_labels[0]}**")
+
+        _selected_ver_id = uuid.UUID(_ver_ids[_sel_ver_idx])
+
+        # Load selected version if it differs from what's in session state
+        _cur = st.session_state.get("current_schedule")
+        if (
+            _cur is None
+            or _cur.year != sel_year
+            or _cur.month != sel_month
+            or _cur.id != _selected_ver_id
+        ):
+            _loaded_ver = load_schedule_by_id(_selected_ver_id)
+            if _loaded_ver:
+                st.session_state["current_schedule"] = _loaded_ver
+                st.session_state["current_demand"] = generate_monthly_demand(
+                    sel_year, sel_month, ships, closed_days=_closed_days
+                )
+                st.session_state["schedule_year"] = sel_year
+                st.session_state["schedule_month"] = sel_month
+                for _k in ("_inf_info", "_inf_demand", "_inf_year", "_inf_month", "_fallback_result"):
+                    st.session_state.pop(_k, None)
+                st.rerun()
 
     # ── Helper: render SolveInfo diagnostics ─────────────────────────────────
     def _render_solver_diagnostics(info) -> None:
@@ -461,7 +646,7 @@ with main_col:
             for d_msg in info.diagnostics:
                 st.error(d_msg)
 
-    # ── Generate first pass ───────────────────────────────────────────────────
+    # ── Generate: check for existing schedule and prompt confirmation ────────
     if generate_clicked:
         if not _avail_emps:
             st.error("Cannot generate: no employees are available for this month. Fix availability dates first.")
@@ -469,6 +654,49 @@ with main_col:
             st.warning("Generating without ship data — demand will be minimal (base staffing only).")
 
     if generate_clicked and _avail_emps:
+        _active_existing = load_saved_schedule(sel_year, sel_month)
+        if _active_existing:
+            st.session_state["_confirm_generate"] = True
+            st.session_state["_confirm_gen_year"] = sel_year
+            st.session_state["_confirm_gen_month"] = sel_month
+            st.rerun()
+        else:
+            st.session_state["_do_generate"] = True
+            st.rerun()
+
+    # ── Confirmation dialog ───────────────────────────────────────────────────
+    if (
+        st.session_state.get("_confirm_generate")
+        and st.session_state.get("_confirm_gen_year") == sel_year
+        and st.session_state.get("_confirm_gen_month") == sel_month
+    ):
+        _existing_for_confirm = load_saved_schedule(sel_year, sel_month)
+        _existing_status = _existing_for_confirm.status.value.upper() if _existing_for_confirm else "?"
+        st.warning(
+            f"⚠️ You already have a **{_existing_status}** schedule for "
+            f"**{SEASON_MONTHS[sel_month]} {sel_year}** (v{_existing_for_confirm.version if _existing_for_confirm else '?'}). "
+            "Generating a new schedule will **archive the current one**. "
+            "You can switch back to it later using the version selector."
+        )
+        _cc1, _cc2 = st.columns(2)
+        if _cc1.button("🔄 Generate New Schedule", type="primary", use_container_width=True, key="confirm_gen_btn"):
+            for _k in ("_confirm_generate", "_confirm_gen_year", "_confirm_gen_month"):
+                st.session_state.pop(_k, None)
+            st.session_state["_do_generate"] = True
+            st.session_state["_do_archive_first"] = True
+            st.rerun()
+        if _cc2.button("Cancel", use_container_width=True, key="cancel_gen_btn"):
+            for _k in ("_confirm_generate", "_confirm_gen_year", "_confirm_gen_month"):
+                st.session_state.pop(_k, None)
+            st.rerun()
+
+    # ── Generate first pass ───────────────────────────────────────────────────
+    if st.session_state.get("_do_generate"):
+        st.session_state.pop("_do_generate", None)
+        if st.session_state.pop("_do_archive_first", False):
+            _next_ver = archive_existing_schedules(sel_year, sel_month)
+        else:
+            _next_ver = 1
         # Clear any prior infeasible/fallback state for a fresh attempt
         for _k in ("_inf_info", "_inf_demand", "_inf_year", "_inf_month", "_fallback_result"):
             st.session_state.pop(_k, None)
@@ -484,22 +712,31 @@ with main_col:
                     info = gen.solve_info
 
                     if result is None:
-                        # Store for the persistent fallback section below
                         st.session_state["_inf_info"] = info
                         st.session_state["_inf_demand"] = demand
                         st.session_state["_inf_year"] = sel_year
                         st.session_state["_inf_month"] = sel_month
-                        # Don't render error here — handled by the infeasible section below
                     else:
+                        # Stamp version on the generated result
+                        result = ScheduleRead(
+                            id=result.id, month=result.month, year=result.year,
+                            status=result.status, version=_next_ver,
+                            created_at=result.created_at,
+                            assignments=result.assignments,
+                            is_fallback=getattr(result, "is_fallback", False),
+                            fallback_notes=getattr(result, "fallback_notes", None),
+                        )
                         st.session_state["current_schedule"] = result
                         st.session_state["current_demand"] = demand
                         st.session_state["schedule_year"] = sel_year
                         st.session_state["schedule_month"] = sel_month
+                        # Reset version selector to show new version
+                        st.session_state.pop(f"_ver_sel_{sel_year}_{sel_month}", None)
                         n_working = sum(1 for a in result.assignments if not a.is_day_off)
                         with st.expander("🔍 Solver diagnostics"):
                             _render_solver_diagnostics(info)
                         st.success(
-                            f"✅ Schedule generated!  \n"
+                            f"✅ Schedule generated! v{_next_ver}  \n"
                             f"**{n_working}** working assignments across **{len(demand)}** days  \n"
                             f"Status: `{info.status_name}` — wall time: {info.wall_time:.1f}s"
                         )
@@ -553,11 +790,13 @@ with main_col:
                         fb_result = None
 
                 if fb_result is not None:
+                    _fb_next_ver = archive_existing_schedules(sel_year, sel_month)
                     fb_schedule = ScheduleRead(
                         id=fb_result.schedule.id,
                         month=fb_result.schedule.month,
                         year=fb_result.schedule.year,
                         status=ScheduleStatus.draft,
+                        version=_fb_next_ver,
                         created_at=fb_result.schedule.created_at,
                         assignments=fb_result.schedule.assignments,
                         is_fallback=True,
@@ -568,6 +807,7 @@ with main_col:
                     st.session_state["schedule_year"] = sel_year
                     st.session_state["schedule_month"] = sel_month
                     st.session_state["_fallback_result"] = fb_result
+                    st.session_state.pop(f"_ver_sel_{sel_year}_{sel_month}", None)
                     for _k in ("_inf_info", "_inf_demand", "_inf_year", "_inf_month"):
                         st.session_state.pop(_k, None)
                     st.rerun()
@@ -608,6 +848,41 @@ with main_col:
             st.info("Month changed. Click 'Generate Schedule' or 'Load Saved' for the selected month.")
         else:
             st.divider()
+
+            # ── Status badge ──────────────────────────────────────────────────
+            _status_val = schedule.status
+            _badge_icon = {"approved": "🟢", "draft": "🟡", "archived": "⬛"}.get(
+                _status_val.value, "🔵"
+            )
+            _ver_num = getattr(schedule, "version", 1)
+            st.markdown(
+                f"**{_badge_icon} {_status_val.value.upper()}** &nbsp;·&nbsp; "
+                f"Version {_ver_num} &nbsp;·&nbsp; "
+                f"ID: `{str(schedule.id)[:8]}…`"
+            )
+
+            # ── Archived banner ───────────────────────────────────────────────
+            _is_archived = _status_val == ScheduleStatus.archived
+            if _is_archived:
+                with st.container(border=True):
+                    st.warning(
+                        "⬛ **This is an archived version.** To make changes, generate a new "
+                        "schedule or restore this version as a new draft."
+                    )
+                    if st.button(
+                        "♻️ Restore This Version as New Draft",
+                        type="primary",
+                        use_container_width=True,
+                        key="restore_archived_btn",
+                    ):
+                        _restored = restore_archived_schedule(schedule)
+                        if _restored:
+                            st.session_state["current_schedule"] = _restored
+                            st.session_state["schedule_year"] = sel_year
+                            st.session_state["schedule_month"] = sel_month
+                            st.session_state.pop(f"_ver_sel_{sel_year}_{sel_month}", None)
+                            st.success(f"✅ Restored as v{_restored.version} (draft).")
+                            st.rerun()
 
             # Flash banner when LLM Apply updates the grid
             if "_apply_flash" in st.session_state:
@@ -666,17 +941,22 @@ with main_col:
 
             # ── Action buttons ────────────────────────────────────────────────
             _is_approved = schedule.status == ScheduleStatus.approved
-            st.info(
-                "💾 **Save Draft** to keep editing later.  "
-                "🏁 **Approve & Finalize** to lock the schedule.  "
-                "📊 **Export** is available after approval.",
-                icon="ℹ️",
-            )
+            if not _is_archived:
+                st.info(
+                    "💾 **Save Draft** to keep editing later.  "
+                    "🏁 **Approve & Finalize** to lock the schedule.  "
+                    "📊 **Export** is available after approval.",
+                    icon="ℹ️",
+                )
             act1, act2, act3, act4 = st.columns(4)
-            status_label = schedule.status.value.upper()
 
             with act1:
-                if st.button("💾 Save Draft", use_container_width=True, disabled=_is_approved):
+                if st.button(
+                    "💾 Save Draft",
+                    use_container_width=True,
+                    disabled=_is_approved or _is_archived,
+                    help="Disabled for approved or archived schedules." if (_is_approved or _is_archived) else None,
+                ):
                     if save_schedule_to_db(schedule):
                         st.success("Saved as draft — you can keep editing.")
                         _next = _next_month_name_if_exists(schedule.year, schedule.month)
@@ -689,13 +969,17 @@ with main_col:
                             )
 
             with act2:
-                if not _is_approved:
+                if _is_archived:
+                    st.button("🏁 Approve & Finalize", use_container_width=True, disabled=True,
+                              help="Archived schedules cannot be approved. Restore first.")
+                elif not _is_approved:
                     if st.button("🏁 Approve & Finalize", use_container_width=True, type="primary"):
                         if save_schedule_to_db(schedule):
                             if approve_schedule_in_db(schedule.id):
                                 updated = ScheduleRead(
                                     id=schedule.id, month=schedule.month, year=schedule.year,
                                     status=ScheduleStatus.approved,
+                                    version=getattr(schedule, "version", 1),
                                     created_at=schedule.created_at,
                                     modified_at=datetime.utcnow(),
                                     assignments=schedule.assignments,
@@ -725,15 +1009,14 @@ with main_col:
                     st.info("Use the Export page in the sidebar to download the schedule.")
 
             with act4:
-                if st.button("🔄 Regenerate", use_container_width=True):
+                if st.button("🔄 Clear View", use_container_width=True):
                     st.session_state.pop("current_schedule", None)
                     st.session_state.pop("current_demand", None)
                     st.rerun()
 
             st.caption(
-                f"Schedule ID: {str(schedule.id)[:8]}… | "
-                f"Status: {status_label} | "
                 f"Created: {schedule.created_at.strftime('%Y-%m-%d %H:%M')}"
+                + (f" · Modified: {schedule.modified_at.strftime('%Y-%m-%d %H:%M')}" if schedule.modified_at else "")
             )
 
             # ── Schedule Grid ─────────────────────────────────────────────────
